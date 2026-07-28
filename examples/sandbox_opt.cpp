@@ -1,0 +1,1183 @@
+// phys2d - GORE LAB: a physics sandbox game that stresses every subsystem.
+//
+//   Windows : native Win32 + GDI window, no external dependencies.
+//   Other   : headless mode, runs a scripted carnage demo and writes a PPM frame.
+//
+// Tools (number keys):
+//   1 grab        drag bodies with a spring          6 bullet     hitscan, entry + exit wounds
+//   2 crate       breakable box (Voronoi fracture)   7 shotgun    9 pellets, heavy spatter
+//   3 barrel      heavy rolling drum                 8 grenade    explosion + dismemberment
+//   4 victim      ragdoll with blood and joints      9 water      SPH fluid hose
+//   5 blade       slice a body apart, deep gash      0 blood      manual blood hose
+//
+// Keys: SPACE pause, S step, R rebuild, C clear gore, B blood overlay, F fluid overlay,
+//       D decals on/off, T slow motion, G gravity, [ ] solver iterations, ESC quit.
+
+#include "phys2d/Blood.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+using namespace phys2d;
+
+namespace {
+
+// ------------------------------------------------------------------- helpers
+uint32_t g_seed = 0xC0FFEEu;
+real rnd() {
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return (real)((g_seed >> 8) & 0xFFFFFFu) / (real)0x1000000u;
+}
+real rnd(real lo, real hi) { return lo + (hi - lo) * rnd(); }
+real clampr(real v, real lo, real hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// ------------------------------------------------------------------ the game
+struct Victim {
+    Ragdoll             doll;
+    std::vector<BodyId> parts;
+    real                health = 1.0;
+    bool                dead = false;
+};
+
+WorldConfig gameConfig() {
+    WorldConfig cfg;
+    cfg.gravity = Vec2(0.0, -9.81);
+    cfg.substeps = 4;
+    cfg.gridCellSize = 2.0;
+    cfg.solver.velocityIterations = 14;
+    cfg.solver.positionIterations = 10;
+    cfg.arenaBytes = 64u * 1024u * 1024u;
+    return cfg;
+}
+
+struct Game {
+    Engine      engine{gameConfig()};
+    BloodSystem blood;
+
+    std::unordered_set<BodyId> flesh;      // bodies that bleed
+    std::unordered_set<BodyId> brittle;    // bodies that shatter
+    std::vector<Victim>        victims;
+
+    // interaction state
+    Vec2   mouse;
+    BodyId dragged = INVALID_BODY;
+    Vec2   dragLocal;
+    int    tool = 1;
+
+    // display toggles
+    bool paused = false, stepOnce = false, running = true;
+    bool showBlood = true, showDecals = true, showFluid = true, showBodies = true;
+    bool slowMotion = false;
+    real timeScale = 1.0;
+
+    // stats
+    double stepMs = 0.0, fps = 0.0;
+    int    shots = 0, kills = 0, dismemberments = 0;
+    real   simTime = 0.0;
+
+};
+
+Game* g_game = nullptr;
+
+BodyId addBox(World& w, const Vec2& p, real hw, real hh, BodyType type,
+              real density, real friction, real restitution, const char* name) {
+    BodyDef d;
+    d.type = type;
+    d.shape = Shape::box(hw * 2.0, hh * 2.0);
+    d.position = p;
+    d.material.density = density;
+    d.material.staticFriction = friction;
+    d.material.dynamicFriction = friction * 0.8;
+    d.material.restitution = restitution;
+    d.name = name;
+    return w.createBody(d);
+}
+
+BodyId addCircle(World& w, const Vec2& p, real r, BodyType type, real density, const char* name) {
+    BodyDef d;
+    d.type = type;
+    d.shape = Shape::circle(r);
+    d.position = p;
+    d.material.density = density;
+    d.material.staticFriction = 0.55;
+    d.material.restitution = 0.20;
+    d.name = name;
+    return w.createBody(d);
+}
+
+// --------------------------------------------------------------- scene setup
+void spawnVictim(Game& g, const Vec2& at) {
+    RagdollConfig cfg;
+    cfg.position = at;
+    cfg.scale = 1.0;
+    cfg.density = 1.05;          // roughly human tissue
+    Victim v;
+    v.doll = createRagdoll(g.engine.world(), cfg);
+    v.parts = v.doll.parts;
+    for (BodyId id : v.parts) {
+        g.flesh.insert(id);
+        RigidBody* b = g.engine.world().body(id);
+        if (b) {
+            b->material.restitution = 0.02;
+            b->material.staticFriction = 0.9;
+            b->material.dynamicFriction = 0.75;
+        }
+    }
+    // Limbs tear off under enough force -> arterial stumps.
+    for (Constraint* c : v.doll.joints) {
+        g.engine.breakables().watch(c, 900.0 + rnd(0.0, 500.0));
+    }
+    g.victims.push_back(v);
+}
+
+BodyId spawnCrate(Game& g, const Vec2& at, real size) {
+    const BodyId id = addBox(g.engine.world(), at, size, size, BodyType::Dynamic, 0.7, 0.6, 0.15, "crate");
+    g.engine.fracture().makeBreakable(id, 16.0);
+    g.brittle.insert(id);
+    return id;
+}
+
+BodyId spawnBarrel(Game& g, const Vec2& at) {
+    return addCircle(g.engine.world(), at, 0.55, BodyType::Dynamic, 1.6, "barrel");
+}
+
+void buildArena(Game& g) {
+    World& w = g.engine.world();
+    w.clear();
+    g.flesh.clear();
+    g.brittle.clear();
+    g.victims.clear();
+    g.blood.clear();
+    g.engine.softBodies().clear();
+    g.engine.fluid().clear();
+
+    // floor and walls
+    addBox(w, Vec2(0.0, -1.0), 30.0, 1.0, BodyType::Static, 1.0, 0.95, 0.05, "floor");
+    addBox(w, Vec2(-30.0, 8.0), 1.0, 10.0, BodyType::Static, 1.0, 0.8, 0.1, "wall_l");
+    addBox(w, Vec2( 30.0, 8.0), 1.0, 10.0, BodyType::Static, 1.0, 0.8, 0.1, "wall_r");
+
+    // platforms and ramps
+    {
+        BodyDef d;
+        d.type = BodyType::Static;
+        d.shape = Shape::box(9.0, 0.4);
+        d.position = Vec2(-13.0, 5.5);
+        d.angle = -0.18;
+        d.name = "ramp_l";
+        w.createBody(d);
+        d.position = Vec2(13.0, 7.5);
+        d.angle = 0.22;
+        d.name = "ramp_r";
+        w.createBody(d);
+    }
+    addBox(w, Vec2(0.0, 3.2), 4.5, 0.35, BodyType::Static, 1.0, 0.8, 0.05, "table");
+
+    // meat grinder: two counter rotating gears
+    {
+        BodyDef d;
+        d.type = BodyType::Kinematic;
+        d.shape = Shape::gear(11, 0.5, 1.35);
+        d.position = Vec2(-6.0, 0.9);
+        d.angularVelocity = 3.4;
+        d.name = "grinder_l";
+        w.createBody(d);
+        d.position = Vec2(-3.2, 0.9);
+        d.angularVelocity = -3.4;
+        d.name = "grinder_r";
+        w.createBody(d);
+    }
+
+    // spinning blade platform
+    {
+        BodyDef d;
+        d.type = BodyType::Kinematic;
+        d.shape = Shape::box(5.0, 0.25);
+        d.position = Vec2(9.0, 2.6);
+        d.angularVelocity = 2.2;
+        d.name = "spinner";
+        w.createBody(d);
+    }
+
+    // stack of breakable crates
+    for (int row = 0; row < 5; ++row) {
+        for (int col = 0; col <= row; ++col) {
+            const real x = 18.0 + (col - row * 0.5) * 1.1;
+            const real y = 0.55 + (4 - row) * 1.1;
+            spawnCrate(g, Vec2(x, y), 0.5);
+        }
+    }
+    // barrels
+    for (int i = 0; i < 6; ++i) spawnBarrel(g, Vec2(-20.0 + i * 1.3, 1.2 + i * 0.2));
+
+    // hanging chain with a wrecking ball
+    {
+        RopeChain chain = buildCatenaryRope(w, Vec2(-8.0, 13.0), Vec2(-2.0, 13.0), 8.0, 12, 0.10, 1.0);
+        if (!chain.links.empty()) {
+            const BodyId ball = addCircle(w, Vec2(-5.0, 8.5), 0.8, BodyType::Dynamic, 6.0, "wrecking_ball");
+            RigidBody* last = w.body(chain.links.back());
+            if (last) w.createRevolute(chain.links.back(), ball, Vec2(0.05, 0.0), Vec2(0.0, 0.8));
+        }
+    }
+
+    // soft body: a sack of tissue that tears
+    {
+        SoftBody sack = SoftBody::grid(Vec2(3.0, 9.0), 2.4, 1.8, 8, 6, 8.0);
+        sack.model = SoftModel::Hybrid;
+        sack.tearStrain = 0.85;
+        sack.pressure = 120.0;
+        sack.friction = 0.6;
+        sack.name = "tissue_sack";
+        g.engine.softBodies().add(sack);
+        g.engine.softBodies().enabled = true;
+    }
+
+    // water pit on the right
+    g.engine.fluid().enabled = true;
+    g.engine.fluid().domain = AABB(Vec2(-29.0, 0.0), Vec2(29.0, 24.0));
+    g.engine.fluid().emitBlock(Vec2(23.0, 0.2), 5.0, 2.0, 0.30);
+
+    // three victims to start with
+    spawnVictim(g, Vec2(-1.0, 6.0));
+    spawnVictim(g, Vec2(1.5, 9.5));
+    spawnVictim(g, Vec2(-10.0, 8.0));
+
+    g.blood.groundLevel = 0.02;
+}
+
+// ------------------------------------------------------------------- damage
+bool isFlesh(const Game& g, BodyId id) { return g.flesh.count(id) != 0; }
+
+void woundFromImpact(Game& g, RigidBody* b, const Vec2& point, const Vec2& normal, real impulse) {
+    if (!b || !isFlesh(g, b->id)) return;
+    const real severity = clampr((impulse - 8.0) / 70.0, 0.05, 1.0);
+    const bool arterial = (impulse > 45.0) || (rnd() < 0.25);
+    g.blood.addWound(b->id, point, normal * -1.0 + Vec2(rnd(-0.3, 0.3), rnd(0.0, 0.4)),
+                     severity, arterial);
+    g.blood.splash(point, 1.5 + impulse * 0.05, (int)(6 + severity * 30), 3.0 + severity * 20.0, 205);
+}
+
+// hitscan weapon: entry wound, internal cavitation, exit spray behind the target
+void fireBullet(Game& g, const Vec2& from, const Vec2& dir, real power) {
+    ++g.shots;
+    const Vec2 d  = (dir.lengthSq() > 1e-12) ? dir.normalized() : Vec2(1.0, 0.0);
+    const Vec2 to = from + d * 90.0;
+
+    std::vector<RayHit> hits;
+    rayCastAll(g.engine.world(), from, to, hits);
+    std::sort(hits.begin(), hits.end(),
+              [](const RayHit& a, const RayHit& b) { return a.fraction < b.fraction; });
+
+    real energy = power;
+    for (const RayHit& h : hits) {
+        if (!h.body || energy <= 0.0) break;
+        RigidBody* b = h.body;
+
+        if (b->isDynamic()) b->applyImpulseAtPoint(d * (energy * 0.05), h.point);
+
+        if (isFlesh(g, b->id)) {
+            // entry: small back spatter towards the shooter
+            g.blood.spray(h.point, d * -1.0 + Vec2(rnd(-0.4, 0.4), 0.25), 4.5, 0.7,
+                          (int)(6 + energy * 0.05), 3.0, 230);
+            g.blood.addWound(b->id, h.point, d, clampr(energy / 140.0, 0.2, 1.0), rnd() < 0.5);
+
+            // exit: violent cone of mist and gushes in the travel direction
+            const Vec2 exit = h.point + d * (b->boundingRadius * 1.6);
+            g.blood.spray(exit, d, 9.0 + energy * 0.05, 0.5,
+                          (int)(20 + energy * 0.35), 14.0 + energy * 0.12, 235);
+            g.blood.addWound(b->id, exit, d, clampr(energy / 90.0, 0.3, 1.0), true);
+            g.blood.stainBody(b->id, 0.4);
+            energy *= 0.45;    // bullet slows down through tissue
+        } else if (g.brittle.count(b->id)) {
+            g.engine.fracture().fracture(b->id, h.point, 5 + (int)(energy * 0.02));
+            energy *= 0.35;
+        } else {
+            energy = 0.0;      // stopped by the wall
+        }
+    }
+}
+
+void fireShotgun(Game& g, const Vec2& from, const Vec2& dir) {
+    for (int i = 0; i < 9; ++i) {
+        const Vec2 d = dir.rotated(rnd(-0.14, 0.14));
+        fireBullet(g, from, d, 55.0 + rnd(0.0, 25.0));
+    }
+}
+
+// blade: cut a body in two and open a long gash
+void sliceAt(Game& g, const Vec2& point) {
+    RigidBody* b = g.engine.world().queryPoint(point);
+    if (!b || !b->isDynamic()) return;
+
+    if (isFlesh(g, b->id)) {
+        const Vec2 cutDir(rnd(-1.0, 1.0), rnd(-1.0, 1.0));
+        g.blood.sever(b->id, point, cutDir, 0.85);
+        g.blood.stainBody(b->id, 0.6);
+        // A deep cut can also detach the limb from its neighbours.
+        for (Victim& v : g.victims) {
+            if (std::find(v.parts.begin(), v.parts.end(), b->id) == v.parts.end()) continue;
+            for (Constraint* c : v.doll.joints) g.engine.breakables().watch(c, 120.0);
+        }
+    } else {
+        g.engine.fracture().fracture(b->id, point, 2 + (int)(rnd() * 3.0));
+    }
+}
+
+void grenade(Game& g, const Vec2& center, real radius, real strength) {
+    for (RigidBody* b : g.engine.world().bodies()) {
+        if (!b->isDynamic()) continue;
+        const Vec2 delta = b->position - center;
+        const real dist = delta.length();
+        if (dist > radius || dist < 1e-6) continue;
+        const real falloff = 1.0 - dist / radius;
+        const Vec2 dir = delta / dist;
+        b->applyImpulseAtPoint(dir * (strength * falloff * b->mass), b->position);
+
+        if (isFlesh(g, b->id)) {
+            const real sev = clampr(falloff * 1.4, 0.2, 1.0);
+            if (falloff > 0.55) {
+                g.blood.sever(b->id, b->position + dir * b->boundingRadius * 0.7, dir, sev);
+                ++g.dismemberments;
+            } else {
+                g.blood.addWound(b->id, b->position + dir * b->boundingRadius * 0.6, dir, sev, true);
+            }
+            g.blood.stainBody(b->id, falloff);
+        } else if (g.brittle.count(b->id) && falloff > 0.25) {
+            g.engine.fracture().fracture(b->id, b->position, 6);
+        }
+    }
+    // shockwave mist
+    g.blood.splash(center, 14.0, 40, 12.0, 240);
+}
+
+void bloodHose(Game& g, const Vec2& at, const Vec2& dir) {
+    g.blood.spray(at, dir, 12.0, 0.22, 14, 9.0, 225);
+}
+
+void waterHose(Game& g, const Vec2& at, const Vec2& dir) {
+    for (int i = 0; i < 6; ++i) {
+        g.engine.fluid().emit(at + Vec2(rnd(-0.1, 0.1), rnd(-0.1, 0.1)),
+                              dir.rotated(rnd(-0.08, 0.08)) * rnd(8.0, 13.0));
+    }
+}
+
+// ------------------------------------------------------------------- wiring
+void installCallbacks(Game& g) {
+    g.engine.world().setBeginContactCallback([&g](const CollisionEvent& ev) {
+        const real imp = ev.normalImpulse;
+        if (imp < 6.0) return;
+        if (ev.a && isFlesh(g, ev.a->id)) woundFromImpact(g, ev.a, ev.point, ev.normal, imp);
+        if (ev.b && isFlesh(g, ev.b->id)) woundFromImpact(g, ev.b, ev.point, ev.normal * -1.0, imp);
+    });
+
+    // A torn joint becomes a stump: both sides gush.
+    g.engine.breakables().setCallback([&g](const JointBreakEvent& ev) {
+        ++g.dismemberments;
+        if (!ev.joint) return;
+        for (Victim& v : g.victims) {
+            if (std::find(v.doll.joints.begin(), v.doll.joints.end(), ev.joint) == v.doll.joints.end())
+                continue;
+            v.dead = true;
+            for (BodyId id : v.parts) {
+                RigidBody* b = g.engine.world().body(id);
+                if (!b) continue;
+                if (rnd() < 0.5) continue;
+                g.blood.sever(id, b->position, Vec2(rnd(-1.0, 1.0), rnd(-0.2, 1.0)), 0.9);
+            }
+            ++g.kills;
+            break;
+        }
+    });
+
+    // Fragments of shattered props inherit the gore bookkeeping.
+    g.engine.fracture().setCallback([&g](const FractureEvent& ev) {
+        g.brittle.erase(ev.original);
+        g.blood.forgetBody(ev.original);
+        for (BodyId frag : ev.fragments) g.brittle.insert(frag);
+    });
+}
+
+void stepGame(Game& g, real dt) {
+    const real scaled = dt * (g.slowMotion ? 0.25 : 1.0) * g.timeScale;
+    g.blood.attach(g.engine.world());
+    g.engine.step(scaled);
+    g.blood.update(scaled);
+    g.simTime += scaled;
+}
+
+// ------------------------------------------------------------- gore geometry
+// Shared by the Win32 renderer and the headless SVG dump: turns a decal into
+// world space points.
+void decalPolygon(Game& g, const BloodDecal& d, std::vector<Vec2>& out) {
+    out.clear();
+    if (d.outline.size() < 3) return;
+    RigidBody* b = (d.body != INVALID_BODY) ? g.engine.world().body(d.body) : nullptr;
+    if (b) {
+        const Transform xf = b->transform();
+        for (const Vec2& p : d.outline) out.push_back(xf.apply(d.anchor + p));
+    } else {
+        for (const Vec2& p : d.outline) out.push_back(d.anchor + p);
+    }
+}
+
+struct Camera {
+    Vec2 center{0.0, 7.0};
+    real scale = 24.0;
+    int  width = 1400, height = 860;
+
+    void toScreen(const Vec2& w, int& x, int& y) const {
+        x = (int)std::lround((w.x - center.x) * scale + width * 0.5);
+        y = (int)std::lround(height * 0.5 - (w.y - center.y) * scale);
+    }
+    Vec2 toWorld(int sx, int sy) const {
+        return Vec2((sx - width * 0.5) / scale + center.x,
+                    (height * 0.5 - sy) / scale + center.y);
+    }
+};
+
+const char* toolName(int t) {
+    switch (t) {
+        case 1: return "grab";
+        case 2: return "crate";
+        case 3: return "barrel";
+        case 4: return "victim";
+        case 5: return "blade";
+        case 6: return "bullet";
+        case 7: return "shotgun";
+        case 8: return "grenade";
+        case 9: return "water";
+        case 0: return "blood hose";
+        default: return "?";
+    }
+}
+
+void useTool(Game& g, const Vec2& at, bool held) {
+    switch (g.tool) {
+        case 2: if (!held) spawnCrate(g, at, 0.5); break;
+        case 3: if (!held) spawnBarrel(g, at); break;
+        case 4: if (!held) spawnVictim(g, at); break;
+        case 5: sliceAt(g, at); break;
+        case 6: if (!held) fireBullet(g, at + Vec2(-14.0, 6.0), (at - (at + Vec2(-14.0, 6.0))), 120.0); break;
+        case 7: if (!held) fireShotgun(g, at + Vec2(-12.0, 5.0), (Vec2(12.0, -5.0)).normalized()); break;
+        case 8: if (!held) grenade(g, at, 7.5, 26.0); break;
+        case 9: waterHose(g, at + Vec2(0.0, 3.0), Vec2(0.0, -1.0)); break;
+        case 0: bloodHose(g, at, Vec2(rnd(-0.3, 0.3), 1.0).normalized()); break;
+        default: break;
+    }
+}
+
+void clearGore(Game& g) { g.blood.clear(); }
+
+} // namespace
+
+#if defined(_WIN32)
+// ============================================================ Win32 front end (SUPER-OPTIMIZED)
+//
+// This renderer targets zero per-frame heap allocation and zero per-frame
+// GDI object churn on the hot path, on top of everything the previous pass
+// already did (GDI reuse, viewport culling):
+//
+//  1. Persistent DIB-section backbuffer -- created once, resized only on
+//     WM_SIZE. No CreateCompatibleBitmap/DeleteObject per frame.
+//  2. Persistent, bounded GDI pen/brush cache -- objects live across frames;
+//     only evicted (oldest-first) once the cache exceeds a small cap. Avoids
+//     re-creating the same skin/blood/floor colours every single frame.
+//  3. Reusable scratch point buffers (thread-local, only ever grow) for every
+//     polygon draw -- no std::vector allocation per decal / per body / per
+//     frame.
+//  4. Decal world-polygon cache -- each decal slot remembers the body
+//     transform it was last projected with. If the owning body has not moved
+//     (common: dried decals on sleeping ragdolls, floor, crates) we skip the
+//     xf.apply() loop entirely and reuse the cached world-space polygon.
+//  5. Direct pixel writes for fluid particles straight into the backbuffer's
+//     DIB memory -- no per-particle SetPixel/GDI call at all.
+//  6. Adaptive quality -- a rolling average of frame time scales the number
+//     of decals/droplets actually rendered (MAX_DECALS_DRAW / droplet cap)
+//     between a floor and a ceiling, so a fight with thousands of gore
+//     particles degrades resolution gracefully instead of the whole game
+//     stuttering.
+//  7. HUD text is reformatted (snprintf + DrawTextA) at ~10 Hz instead of
+//     every frame; the string rarely needs to be legible faster than that.
+//
+// Gameplay/physics code below this banner is byte-for-byte identical to
+// sandbox_game.cpp -- only the renderer changed.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <unordered_map>
+#include <deque>
+#ifndef GET_X_LPARAM
+#define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
+#define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
+#endif
+
+namespace {
+
+Camera g_cam;
+bool   g_mouseDown = false;
+
+// ---------------------------------------------------------- persistent GDI cache
+// Pens/brushes are reused across frames. Bounded so a long session with many
+// distinct colours (wetness/oxygen gradients are continuous) can't leak GDI
+// handles -- oldest entries are evicted once the cap is hit.
+struct GdiCache {
+    struct PenKey {
+        COLORREF c; int w;
+        bool operator==(const PenKey& o) const { return c == o.c && w == o.w; }
+    };
+    struct PenHash {
+        size_t operator()(const PenKey& k) const {
+            return std::hash<uint64_t>()((uint64_t)k.c << 8 | (uint32_t)k.w);
+        }
+    };
+
+    static constexpr size_t kMaxBrushes = 192;
+    static constexpr size_t kMaxPens    = 192;
+
+    std::unordered_map<COLORREF, HBRUSH>        brushes;
+    std::deque<COLORREF>                        brushOrder;
+    std::unordered_map<PenKey, HPEN, PenHash>   pens;
+    std::deque<PenKey>                          penOrder;
+
+    HBRUSH brush(COLORREF c) {
+        auto it = brushes.find(c);
+        if (it != brushes.end()) return it->second;
+        if (brushes.size() >= kMaxBrushes && !brushOrder.empty()) {
+            const COLORREF victim = brushOrder.front();
+            brushOrder.pop_front();
+            auto v = brushes.find(victim);
+            if (v != brushes.end()) { DeleteObject(v->second); brushes.erase(v); }
+        }
+        HBRUSH b = CreateSolidBrush(c);
+        brushes[c] = b;
+        brushOrder.push_back(c);
+        return b;
+    }
+    HPEN pen(COLORREF c, int w = 1) {
+        PenKey k{c, w};
+        auto it = pens.find(k);
+        if (it != pens.end()) return it->second;
+        if (pens.size() >= kMaxPens && !penOrder.empty()) {
+            const PenKey victim = penOrder.front();
+            penOrder.pop_front();
+            auto v = pens.find(victim);
+            if (v != pens.end()) { DeleteObject(v->second); pens.erase(v); }
+        }
+        HPEN p = CreatePen(PS_SOLID, w, c);
+        pens[k] = p;
+        penOrder.push_back(k);
+        return p;
+    }
+    void releaseAll() {
+        for (auto& kv : brushes) DeleteObject(kv.second);
+        for (auto& kv : pens)    DeleteObject(kv.second);
+        brushes.clear(); brushOrder.clear();
+        pens.clear();    penOrder.clear();
+    }
+} g_gdi;
+
+// ---------------------------------------------------------- persistent backbuffer
+// A 32bpp top-down DIB section: GDI functions (Polygon/Ellipse/LineTo) draw
+// into it exactly like any other DC, but we can also poke raw pixels for the
+// fluid particles without going through the GDI pipeline at all.
+struct Backbuffer {
+    HDC     dc   = nullptr;
+    HBITMAP bmp  = nullptr;
+    void*   bits = nullptr;
+    int     w = 0, h = 0;
+
+    void ensure(HDC screenDc, int width, int height) {
+        if (bmp && w == width && h == height) return;
+        release();
+        w = width; h = height;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = width;
+        bi.bmiHeader.biHeight      = -height; // top-down: row 0 is the top row
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        dc  = CreateCompatibleDC(screenDc);
+        bmp = CreateDIBSection(screenDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        SelectObject(dc, bmp);
+    }
+    void release() {
+        if (dc)  { DeleteDC(dc); dc = nullptr; }
+        if (bmp) { DeleteObject(bmp); bmp = nullptr; }
+        bits = nullptr; w = h = 0;
+    }
+    inline void clear(uint8_t r, uint8_t g, uint8_t b) {
+        if (!bits) return;
+        uint32_t* px = (uint32_t*)bits;
+        const uint32_t col = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        const size_t n = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < n; ++i) px[i] = col;
+    }
+    inline void putPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        if ((unsigned)x >= (unsigned)w || (unsigned)y >= (unsigned)h || !bits) return;
+        uint8_t* p = (uint8_t*)bits + (size_t)y * (size_t)w * 4 + (size_t)x * 4;
+        p[0] = b; p[1] = g; p[2] = r; p[3] = 0xFF;
+    }
+} g_back;
+
+// ---------------------------------------------------------- reusable scratch buffers
+// thread_local so the game stays safe if ever multithreaded; only ever grows,
+// never shrinks, so steady state has zero allocations.
+thread_local std::vector<POINT> g_scratchPts;
+
+const POINT* toScreenPts(const std::vector<Vec2>& world, size_t& outCount) {
+    if (g_scratchPts.size() < world.size()) g_scratchPts.resize(world.size());
+    for (size_t i = 0; i < world.size(); ++i) {
+        int x = 0, y = 0;
+        g_cam.toScreen(world[i], x, y);
+        g_scratchPts[i].x = x;
+        g_scratchPts[i].y = y;
+    }
+    outCount = world.size();
+    return g_scratchPts.data();
+}
+
+// ---------------------------------------------------------- viewport culling
+bool inView(const Vec2& lo, const Vec2& hi) {
+    const real half_w = g_cam.width  * 0.5 / g_cam.scale;
+    const real half_h = g_cam.height * 0.5 / g_cam.scale;
+    const real vl = g_cam.center.x - half_w, vr = g_cam.center.x + half_w;
+    const real vb = g_cam.center.y - half_h, vt = g_cam.center.y + half_h;
+    return lo.x < vr && hi.x > vl && lo.y < vt && hi.y > vb;
+}
+bool inViewPt(const Vec2& p, real margin = 1.0) {
+    return inView(p - Vec2(margin, margin), p + Vec2(margin, margin));
+}
+
+void fillPolyWorld(HDC dc, const std::vector<Vec2>& world, COLORREF col) {
+    if (world.size() < 3) return;
+    size_t n = 0;
+    const POINT* pts = toScreenPts(world, n);
+    HGDIOBJ ob = SelectObject(dc, g_gdi.brush(col));
+    HGDIOBJ op = SelectObject(dc, g_gdi.pen(col));
+    Polygon(dc, pts, (int)n);
+    SelectObject(dc, ob); SelectObject(dc, op);
+}
+
+// ---------------------------------------------------------- decal world-polygon cache
+// Keyed by slot index in blood.decals(). Recomputing xf.apply() for every
+// outline point of every decal every frame is wasted work once a decal's
+// owning body has stopped moving (the overwhelming majority of them, once a
+// fight settles: dried blood on the floor, on sleeping ragdolls, on static
+// crates). We only redo the projection when position/angle actually changed.
+struct DecalCacheEntry {
+    bool   valid = false;
+    BodyId body  = INVALID_BODY;
+    Vec2   pos{1e30, 1e30};
+    real   angle = 1e30;
+    std::vector<Vec2> world;
+};
+std::vector<DecalCacheEntry> g_decalCache;
+
+const std::vector<Vec2>& cachedDecalWorld(Game& g, size_t slot, const BloodDecal& d) {
+    if (g_decalCache.size() <= slot) g_decalCache.resize(slot + 1);
+    DecalCacheEntry& ce = g_decalCache[slot];
+
+    RigidBody* b = (d.body != INVALID_BODY) ? g.engine.world().body(d.body) : nullptr;
+    const Vec2 pos   = b ? b->position : Vec2();
+    const real angle = b ? b->angle    : 0.0;
+
+    const bool sameBody  = ce.valid && ce.body == d.body;
+    const bool samePlace = sameBody && (pos - ce.pos).lengthSq() < 1e-8 &&
+                            std::fabs(angle - ce.angle) < 1e-6;
+    if (samePlace) return ce.world;
+
+    decalPolygon(g, d, ce.world);
+    ce.valid = true;
+    ce.body  = d.body;
+    ce.pos   = pos;
+    ce.angle = angle;
+    return ce.world;
+}
+
+// ---------------------------------------------------------- adaptive quality
+// A rolling average render time nudges the decal/droplet draw budget between
+// a floor and a ceiling. Cheap and self-correcting: no PID controller needed
+// for a one-dimensional "draw fewer particles" knob.
+struct AdaptiveQuality {
+    double emaMs = 8.0;
+    size_t maxDecals   = 2500;
+    size_t maxDroplets = 6000;
+
+    void feed(double frameMs) {
+        emaMs = emaMs * 0.9 + frameMs * 0.1;
+        // Budget: we want the render under ~9 ms (leaves headroom for a 60 Hz
+        // frame that also has to run the physics step).
+        if (emaMs > 11.0) {
+            maxDecals   = (size_t)(maxDecals   * 0.92);
+            maxDroplets = (size_t)(maxDroplets * 0.92);
+        } else if (emaMs < 6.0) {
+            maxDecals   = (size_t)(maxDecals   * 1.03) + 8;
+            maxDroplets = (size_t)(maxDroplets * 1.03) + 8;
+        }
+        maxDecals   = std::min<size_t>(std::max<size_t>(maxDecals,   400),  7000);
+        maxDroplets = std::min<size_t>(std::max<size_t>(maxDroplets, 800), 24000);
+    }
+} g_quality;
+
+void drawGore(HDC dc, Game& g) {
+    uint8_t r, gr, b;
+
+    // --- pools (small count, always drawn in full) ---
+    SelectObject(dc, GetStockObject(NULL_PEN));
+    for (const BloodPool& p : g.blood.pools()) {
+        if (!inViewPt(p.center, p.halfWidth + 0.5)) continue;
+        BloodSystem::colorOf(p.oxygen, p.wetness, r, gr, b);
+        COLORREF col = RGB(r, gr, b);
+        int x0, y0, x1, y1;
+        g_cam.toScreen(Vec2(p.center.x - p.halfWidth, p.center.y + p.depth), x0, y0);
+        g_cam.toScreen(Vec2(p.center.x + p.halfWidth, p.center.y - p.depth * 0.4), x1, y1);
+        HGDIOBJ ob = SelectObject(dc, g_gdi.brush(col));
+        HGDIOBJ op = SelectObject(dc, g_gdi.pen(col));
+        Ellipse(dc, x0, y0, x1, y1);
+        SelectObject(dc, ob); SelectObject(dc, op);
+    }
+
+    // --- decals: adaptive count, world-polygon cache, no per-call vector alloc ---
+    if (g.showDecals) {
+        const auto& all = g.blood.decals();
+        const size_t total = all.size();
+        const size_t budget = g_quality.maxDecals;
+        const size_t skip_head = (total > budget) ? (total - budget) : 0;
+        for (size_t di = skip_head; di < total; ++di) {
+            const BloodDecal& d = all[di];
+            if (!inViewPt(d.anchor, 1.5)) continue;
+            BloodSystem::colorOf(d.oxygen, d.wetness, r, gr, b);
+            const std::vector<Vec2>& poly = cachedDecalWorld(g, di, d);
+            fillPolyWorld(dc, poly, RGB(r, gr, b));
+        }
+    }
+
+    // --- airborne droplets: adaptive count, batched by colour to minimise pen switches ---
+    struct Drop { int x0, y0, x1, y1; COLORREF col; int rad; };
+    static thread_local std::vector<Drop> dropsVis;
+    dropsVis.clear();
+    const auto& allDrops = g.blood.droplets();
+    const size_t dropBudget = g_quality.maxDroplets;
+    const size_t dropStride = (allDrops.size() > dropBudget && dropBudget > 0)
+                                  ? std::max<size_t>(1, allDrops.size() / dropBudget) : 1;
+    for (size_t i = 0; i < allDrops.size(); i += dropStride) {
+        const BloodDroplet& d = allDrops[i];
+        if (!inViewPt(d.position, 0.5)) continue;
+        BloodSystem::colorOf(d.oxygen, 1.0, r, gr, b);
+        if (d.kind == BloodKind::Mist) { r = (uint8_t)(r * 0.8); gr = (uint8_t)(gr * 0.7); }
+        int x, y; g_cam.toScreen(d.position, x, y);
+        int px, py; g_cam.toScreen(d.position - d.velocity * 0.016, px, py);
+        const int rad = std::max(1, (int)std::lround(d.radius * g_cam.scale));
+        COLORREF col = RGB(r & 0xF8, gr & 0xF8, b & 0xF8); // quantise: more pen reuse
+        dropsVis.push_back({px, py, x, y, col, rad});
+    }
+    std::sort(dropsVis.begin(), dropsVis.end(), [](const Drop& a, const Drop& c) {
+        if (a.col != c.col) return a.col < c.col;
+        return a.rad < c.rad;
+    });
+    COLORREF curCol = 0xFFFFFFFFu; int curRad = -1;
+    for (const Drop& dr : dropsVis) {
+        if (dr.col != curCol || dr.rad != curRad) {
+            curCol = dr.col; curRad = dr.rad;
+            SelectObject(dc, g_gdi.pen(curCol, curRad));
+        }
+        MoveToEx(dc, dr.x0, dr.y0, nullptr);
+        LineTo(dc, dr.x1, dr.y1);
+    }
+}
+
+void drawBodies(HDC dc, Game& g) {
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    for (RigidBody* b : g.engine.world().bodies()) {
+        if (!inView(b->aabb.min, b->aabb.max)) continue;
+
+        const real wet = g.blood.wetnessOf(b->id);
+        COLORREF col;
+        if (b->isStatic())          col = RGB(120, 128, 138);
+        else if (b->isKinematic())  col = RGB(230, 160,  70);
+        else if (isFlesh(g, b->id)) col = RGB(215, 175, 160);
+        else                        col = RGB(120, 195, 245);
+        if (wet > 0.05) {
+            const int rr = (int)(GetRValue(col) * (1.0 - wet) + 190 * wet);
+            const int gg = (int)(GetGValue(col) * (1.0 - wet) +  30 * wet);
+            const int bb = (int)(GetBValue(col) * (1.0 - wet) +  34 * wet);
+            col = RGB(rr, gg, bb);
+        }
+        const int pw = isFlesh(g, b->id) ? 2 : 1;
+        HGDIOBJ op = SelectObject(dc, g_gdi.pen(col, pw));
+
+        if (b->shape.type == ShapeType::Circle) {
+            int cx, cy; g_cam.toScreen(b->position, cx, cy);
+            const int rad = (int)std::lround(b->shape.radius * g_cam.scale);
+            Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
+        } else if (b->shape.type == ShapeType::Capsule) {
+            Vec2 a, e; b->shape.capsuleSegment(b->transform(), a, e);
+            int ax, ay, ex, ey; g_cam.toScreen(a, ax, ay); g_cam.toScreen(e, ex, ey);
+            const int rad = (int)std::lround(b->shape.radius * g_cam.scale);
+            Ellipse(dc, ax - rad, ay - rad, ax + rad, ay + rad);
+            Ellipse(dc, ex - rad, ey - rad, ex + rad, ey + rad);
+            MoveToEx(dc, ax, ay, nullptr); LineTo(dc, ex, ey);
+        } else if (b->worldVertices.size() >= 2) {
+            size_t n = 0;
+            const POINT* pts = toScreenPts(b->worldVertices, n);
+            Polygon(dc, pts, (int)n);
+        }
+        SelectObject(dc, op);
+    }
+
+    // soft-body links
+    {
+        HGDIOBJ osp = SelectObject(dc, g_gdi.pen(RGB(210, 120, 140), 1));
+        for (size_t i = 0; i < g.engine.softBodies().count(); ++i) {
+            SoftBody* sb = g.engine.softBodies().at(i);
+            for (const SoftLink& l : sb->links) {
+                if (l.broken) continue;
+                const Vec2& pa = sb->nodes[(size_t)l.a].position;
+                const Vec2& pb = sb->nodes[(size_t)l.b].position;
+                if (!inView(Vec2(std::min(pa.x, pb.x), std::min(pa.y, pb.y)),
+                            Vec2(std::max(pa.x, pb.x), std::max(pa.y, pb.y)))) continue;
+                int ax, ay, bx, by;
+                g_cam.toScreen(pa, ax, ay); g_cam.toScreen(pb, bx, by);
+                MoveToEx(dc, ax, ay, nullptr); LineTo(dc, bx, by);
+            }
+        }
+        SelectObject(dc, osp);
+    }
+
+    // fluid particles: direct pixel writes into the backbuffer's DIB memory,
+    // bypassing GDI entirely -- this is the single biggest win for the fluid
+    // hose / water pit scenes, which can have thousands of particles on screen.
+    if (g.showFluid && g_back.bits) {
+        for (const FluidParticle& p : g.engine.fluid().particles()) {
+            if (!inViewPt(p.position, 0.4)) continue;
+            int x, y; g_cam.toScreen(p.position, x, y);
+            g_back.putPixel(x,     y,     90, 170, 235);
+            g_back.putPixel(x + 1, y,     70, 150, 215);
+            g_back.putPixel(x,     y + 1, 70, 150, 215);
+        }
+    }
+}
+
+void drawHud(HDC dc, Game& g) {
+    // Reformat at ~10 Hz -- snprintf + two DrawTextA calls on a long string
+    // are surprisingly not free at 60 fps, and the numbers don't need to be
+    // legible faster than that anyway.
+    static char buf[1200] = {0};
+    static int  frame = 0;
+    if ((frame++ % 6) == 0) {
+        const BloodStats bs = g.blood.stats();
+        std::snprintf(buf, sizeof(buf),
+            "phys2d GORE LAB [SUPER-OPT]   tool [%d] %s%s\n"
+            "bodies %zu   contacts %zu   islands %zu   step %.2f ms   fps %.0f\n"
+            "blood: droplets %zu/%zu  decals %zu/%zu  pools %zu  wounds %zu\n"
+            "volume: airborne %.0f ml  on surfaces %.0f ml  pooled %.0f ml  spilled %.0f ml\n"
+            "victims %zu  kills %d  shots %d  fractures %d\n"
+            "1 grab  2 crate  3 barrel  4 victim  5 blade  6 bullet  7 shotgun  8 grenade  9 water  0 blood\n"
+            "SPACE pause  S step  R rebuild  C clear  D decals  F fluid  T slow-mo  G gravity  [ ] iters  ESC",
+            g.tool, toolName(g.tool), g.paused ? "   [PAUSED]" : "",
+            g.engine.world().bodyCount(), g.engine.world().contactCount(),
+            g.engine.islands().islandCount(), g.stepMs, g.fps,
+            bs.droplets, g_quality.maxDroplets, bs.decals, g_quality.maxDecals, bs.pools, bs.wounds,
+            bs.airborneMl, bs.decalMl, bs.pooledMl, bs.spilledMl,
+            g.victims.size(), g.kills, g.shots,
+            g.engine.fracture().fracturesTotal());
+    }
+    RECT r{12, 10, 1390, 200};
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(20, 20, 20));
+    DrawTextA(dc, buf, -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP);
+    RECT r2{11, 9, 1389, 199};
+    SetTextColor(dc, RGB(226, 232, 240));
+    DrawTextA(dc, buf, -1, &r2, DT_LEFT | DT_TOP | DT_NOCLIP);
+}
+
+void render(HWND hwnd, Game& g) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc; GetClientRect(hwnd, &rc);
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    g_cam.width = w; g_cam.height = h;
+
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    g_back.ensure(dc, w, h);
+    g_back.clear(24, 26, 30);
+
+    if (g_back.dc) {
+        SelectObject(g_back.dc, GetStockObject(NULL_BRUSH));
+        if (g.showBlood)  drawGore(g_back.dc, g);
+        if (g.showBodies) drawBodies(g_back.dc, g);
+        drawHud(g_back.dc, g);
+        BitBlt(dc, 0, 0, w, h, g_back.dc, 0, 0, SRCCOPY);
+    }
+
+    QueryPerformanceCounter(&t1);
+    const double renderMs = 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart);
+    g_quality.feed(renderMs);
+
+    EndPaint(hwnd, &ps);
+}
+
+void applyDrag(Game& g) {
+    if (g.dragged == INVALID_BODY) return;
+    RigidBody* b = g.engine.world().body(g.dragged);
+    if (!b) { g.dragged = INVALID_BODY; return; }
+    const Vec2 grab  = b->transform().apply(g.dragLocal);
+    const Vec2 delta = g.mouse - grab;
+    const Vec2 force = delta * (700.0 * b->mass) - b->velocityAtPoint(grab) * (55.0 * b->mass);
+    b->applyForceAtPoint(force, grab);
+}
+
+LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Game* g = g_game;
+    if (!g) return DefWindowProcA(hwnd, msg, wp, lp);
+    switch (msg) {
+        case WM_CLOSE:
+        case WM_DESTROY: g->running = false; return 0;
+        case WM_PAINT:    render(hwnd, *g); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_SIZE: return 0; // backbuffer resizes lazily in render()
+        case WM_MOUSEMOVE:
+            g->mouse = g_cam.toWorld(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (g_mouseDown && g->tool != 1) useTool(*g, g->mouse, true);
+            return 0;
+        case WM_LBUTTONDOWN: {
+            g->mouse = g_cam.toWorld(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            g_mouseDown = true;
+            if (g->tool == 1) {
+                RigidBody* b = g->engine.world().queryPoint(g->mouse);
+                if (b && b->isDynamic()) {
+                    g->dragged = b->id;
+                    g->dragLocal = b->transform().invApply(g->mouse);
+                    b->wake();
+                }
+            } else {
+                useTool(*g, g->mouse, false);
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP: g_mouseDown = false; g->dragged = INVALID_BODY; return 0;
+        case WM_RBUTTONDOWN:
+            g->mouse = g_cam.toWorld(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            grenade(*g, g->mouse, 7.5, 26.0);
+            return 0;
+        case WM_MOUSEWHEEL:
+            g_cam.scale = clampr(g_cam.scale * ((GET_WHEEL_DELTA_WPARAM(wp) > 0) ? 1.12 : 1.0 / 1.12), 6.0, 140.0);
+            return 0;
+        case WM_KEYDOWN:
+            switch (wp) {
+                case VK_ESCAPE: g->running = false; break;
+                case VK_SPACE:  g->paused = !g->paused; break;
+                case 'S':       g->stepOnce = true; break;
+                case 'R':       buildArena(*g); g_decalCache.clear(); break;
+                case 'C':       clearGore(*g);  g_decalCache.clear(); break;
+                case 'B':       g->showBlood = !g->showBlood; break;
+                case 'D':       g->showDecals = !g->showDecals; break;
+                case 'F':       g->showFluid = !g->showFluid; break;
+                case 'T':       g->slowMotion = !g->slowMotion; break;
+                case 'G': {
+                    const Vec2 gr = g->engine.world().gravity();
+                    g->engine.world().setGravity(gr.lengthSq() > 1e-6 ? Vec2() : Vec2(0.0, -9.81));
+                    break;
+                }
+                case VK_OEM_4: { SolverConfig& s = g->engine.world().config().solver;
+                    s.velocityIterations = std::max(2, s.velocityIterations - 2); break; }
+                case VK_OEM_6: { SolverConfig& s = g->engine.world().config().solver;
+                    s.velocityIterations = std::min(60, s.velocityIterations + 2); break; }
+                case VK_LEFT:  g_cam.center.x -= 1.5; break;
+                case VK_RIGHT: g_cam.center.x += 1.5; break;
+                case VK_UP:    g_cam.center.y += 1.5; break;
+                case VK_DOWN:  g_cam.center.y -= 1.5; break;
+                default: if (wp >= '0' && wp <= '9') g->tool = (int)(wp - '0'); break;
+            }
+            return 0;
+        default: break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+} // namespace
+
+int main() {
+    Game game;
+    g_game = &game;
+    buildArena(game);
+    installCallbacks(game);
+
+    WNDCLASSA wc{};
+    wc.lpfnWndProc   = wndProc;
+    wc.hInstance     = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "phys2d_gore_lab_opt";
+    wc.hCursor       = LoadCursor(nullptr, IDC_CROSS);
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    RegisterClassA(&wc);
+
+    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "phys2d - GORE LAB (super-optimized)",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 1400, 900,
+                                nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) { std::printf("cannot create window\n"); return 1; }
+
+    LARGE_INTEGER freq, prev;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&prev);
+    double acc = 0.0;
+    const double fixedDt = 1.0 / 60.0;
+
+    while (game.running) {
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) game.running = false;
+            TranslateMessage(&msg); DispatchMessageA(&msg);
+        }
+        if (!game.running) break;
+
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const double elapsed = double(now.QuadPart - prev.QuadPart) / double(freq.QuadPart);
+        prev = now;
+        game.fps = (elapsed > 1e-9) ? 1.0 / elapsed : 0.0;
+
+        acc = (acc + elapsed < 0.25) ? acc + elapsed : 0.25;
+        while (acc >= fixedDt) {
+            acc -= fixedDt;
+            if (!game.paused || game.stepOnce) {
+                LARGE_INTEGER t0, t1;
+                QueryPerformanceCounter(&t0);
+                applyDrag(game);
+                stepGame(game, (real)fixedDt);
+                QueryPerformanceCounter(&t1);
+                game.stepMs = 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart);
+                game.stepOnce = false;
+            } else break;
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        Sleep(1);
+    }
+    g_gdi.releaseAll();
+    g_back.release();
+    g_game = nullptr;
+    return 0;
+}
+
+#else
+// ============================================================ headless replay
+namespace {
+
+void writeSvg(Game& g, const char* path) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    const real minX = -31.0, maxX = 31.0, minY = -2.0, maxY = 20.0;
+    const real sc = 26.0;
+    const int W = (int)((maxX - minX) * sc), H = (int)((maxY - minY) * sc);
+    std::fprintf(f, "<svg xmlns='http://www.w3.org/2000/svg' width='%d' height='%d'>\n", W, H);
+    std::fprintf(f, "<rect width='100%%' height='100%%' fill='#181a1e'/>\n");
+    auto X = [&](real x) { return (x - minX) * sc; };
+    auto Y = [&](real y) { return (maxY - y) * sc; };
+
+    uint8_t r, gg, b;
+    for (const BloodPool& p : g.blood.pools()) {
+        BloodSystem::colorOf(p.oxygen, p.wetness, r, gg, b);
+        std::fprintf(f, "<ellipse cx='%.1f' cy='%.1f' rx='%.1f' ry='%.1f' fill='rgb(%d,%d,%d)'/>\n",
+                     X(p.center.x), Y(p.center.y), p.halfWidth * sc,
+                     std::max((real)1.5, p.depth * sc * 2.0), r, gg, b);
+    }
+    std::vector<Vec2> poly;
+    for (const BloodDecal& d : g.blood.decals()) {
+        BloodSystem::colorOf(d.oxygen, d.wetness, r, gg, b);
+        decalPolygon(g, d, poly);
+        if (poly.size() < 3) continue;
+        std::fprintf(f, "<polygon points='");
+        for (const Vec2& p : poly) std::fprintf(f, "%.1f,%.1f ", X(p.x), Y(p.y));
+        std::fprintf(f, "' fill='rgb(%d,%d,%d)'/>\n", r, gg, b);
+    }
+    for (const BloodDroplet& d : g.blood.droplets()) {
+        BloodSystem::colorOf(d.oxygen, 1.0, r, gg, b);
+        std::fprintf(f, "<circle cx='%.1f' cy='%.1f' r='%.1f' fill='rgb(%d,%d,%d)'/>\n",
+                     X(d.position.x), Y(d.position.y), std::max((real)0.8, d.radius * sc), r, gg, b);
+    }
+    for (RigidBody* body : g.engine.world().bodies()) {
+        const char* stroke = body->isStatic() ? "#7a828c" : (isFlesh(g, body->id) ? "#d7afa0" : "#78c3f5");
+        if (body->shape.type == ShapeType::Circle) {
+            std::fprintf(f, "<circle cx='%.1f' cy='%.1f' r='%.1f' fill='none' stroke='%s'/>\n",
+                         X(body->position.x), Y(body->position.y), body->shape.radius * sc, stroke);
+        } else if (body->worldVertices.size() >= 3) {
+            std::fprintf(f, "<polygon points='");
+            for (const Vec2& p : body->worldVertices) std::fprintf(f, "%.1f,%.1f ", X(p.x), Y(p.y));
+            std::fprintf(f, "' fill='none' stroke='%s'/>\n", stroke);
+        }
+    }
+    for (const FluidParticle& p : g.engine.fluid().particles()) {
+        std::fprintf(f, "<circle cx='%.1f' cy='%.1f' r='1.6' fill='#4e9fd8'/>\n",
+                     X(p.position.x), Y(p.position.y));
+    }
+    std::fprintf(f, "</svg>\n");
+    std::fclose(f);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    int steps = 600;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--steps") == 0 && i + 1 < argc) steps = std::atoi(argv[++i]);
+    }
+
+    Game game;
+    g_game = &game;
+    buildArena(game);
+    installCallbacks(game);
+
+    std::printf("phys2d GORE LAB (headless): %zu bodies, %d steps\n",
+                game.engine.world().bodyCount(), steps);
+
+    const real dt = 1.0 / 60.0;
+    for (int i = 0; i < steps; ++i) {
+        // scripted carnage so every subsystem is exercised
+        if (i == 40)  fireBullet(game, Vec2(-24.0, 7.0), Vec2(1.0, -0.05), 140.0);
+        if (i == 90)  fireShotgun(game, Vec2(-22.0, 6.0), Vec2(1.0, 0.05).normalized());
+        if (i == 150) sliceAt(game, Vec2(1.5, 8.0));
+        if (i == 200) grenade(game, Vec2(0.0, 4.0), 8.0, 30.0);
+        if (i == 260) spawnVictim(game, Vec2(6.0, 12.0));
+        if (i == 300) grenade(game, Vec2(18.0, 3.0), 9.0, 34.0);
+        if (i >= 340 && i < 380) waterHose(game, Vec2(12.0, 12.0), Vec2(-0.3, -1.0).normalized());
+        if (i >= 420 && i < 450) bloodHose(game, Vec2(-14.0, 10.0), Vec2(1.0, 0.3).normalized());
+
+        stepGame(game, dt);
+
+        if (i % 120 == 0) {
+            const BloodStats bs = game.blood.stats();
+            std::printf("step %4d  bodies %4zu  contacts %4zu  drops %5zu  decals %5zu  pools %3zu  "
+                        "wounds %2zu  spilled %6.0f ml\n",
+                        i, game.engine.world().bodyCount(), game.engine.world().contactCount(),
+                        bs.droplets, bs.decals, bs.pools, bs.wounds, bs.spilledMl);
+        }
+    }
+
+    const BloodStats bs = game.blood.stats();
+    std::printf("\n--- final ---\n");
+    std::printf("bodies %zu  fragments from fractures %d  dismemberments %d  kills %d  shots %d\n",
+                game.engine.world().bodyCount(), game.engine.fracture().fracturesTotal(),
+                game.dismemberments, game.kills, game.shots);
+    std::printf("blood: droplets %zu, decals %zu, pools %zu, open wounds %zu\n",
+                bs.droplets, bs.decals, bs.pools, bs.wounds);
+    std::printf("volume: airborne %.0f ml, on surfaces %.0f ml, pooled %.0f ml, total spilled %.1f l\n",
+                bs.airborneMl, bs.decalMl, bs.pooledMl, bs.spilledMl / 1000.0);
+    std::printf("fluid particles %zu, soft bodies %zu, islands %d\n",
+                game.engine.fluid().count(), game.engine.softBodies().count(),
+                game.engine.islands().islandCount());
+
+    writeSvg(game, "gore_frame.svg");
+    std::printf("wrote gore_frame.svg\n");
+    g_game = nullptr;
+    return 0;
+}
+#endif
