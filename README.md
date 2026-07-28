@@ -1,13 +1,12 @@
-# phys2d v2 — расширение движка
+# phys2d 
 
-Слой v2 добавляется к существующему движку: новый заголовок `include/phys2d/Extras.h`,
+Заголовок `include/phys2d/Extras.h`,
 шесть модулей реализации `src/Extras_*.cpp`, демо `examples/demo_v2.cpp`.
-Старый API не сломан — весь v1 код продолжает работать.
 
 ## Сборка (MSYS2 MINGW64)
 
 ```bash
-cd /d/projects/phys2d
+cd /c/
 cmake -B build -G "MinGW Makefiles" \
   -DCMAKE_MAKE_PROGRAM=mingw32-make \
   -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
@@ -122,10 +121,10 @@ std::puts(engine.statusLine().c_str());
 
 Все 11 сцен помечены как стабильные (без роста энергии и NaN).
 
-## Файлы этапа v2
+## Файлы этапа 
 
 ```
-include/phys2d/Extras.h        — весь v2 API
+include/phys2d/Extras.h        — весь API
 include/phys2d/World.h         — + addConstraint, contact filter, post-step callback
 include/phys2d/Constraints.h   — + типы Weld/Motor/Prismatic/Pulley/Gear/Catenary
 src/World.cpp                  — поддержка фильтра контактов и колбэка шага
