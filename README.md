@@ -17,7 +17,7 @@
 - **[Phys2D interactive scene](README_REALTIME_EN.md)** — testing physics in real time english docs
 - **[Phys2D documentation (English)](DOCS_EN.md)** - full technical documentation in English
 - **[Phys2D для игр](README_GAME.md)** — создание игр с физикой, кровью и разрушением
-- **[Phys2D документация (English)](DOCS.md)** — полная техническая документация на русском
+- **[Phys2D документация](DOCS.md)** — полная техническая документация на русском
 - **[Phys2D интерактивная сцена](README_REALTIME.md)** — тестирование физики в реальном времени
 
 ---
