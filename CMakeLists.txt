@@ -151,3 +151,11 @@ endif()
 
 install(TARGETS phys2d phys2d_shared ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
 install(DIRECTORY include/phys2d DESTINATION include)
+
+# ---------------------------------------------------------------- GoreLab Remake
+add_executable(phys2d_gorelab examples/gorelab_remake.cpp)
+target_link_libraries(phys2d_gorelab PRIVATE phys2d phys2d_flags)
+if(WIN32)
+    target_link_libraries(phys2d_gorelab PRIVATE gdi32 user32)
+    set_target_properties(phys2d_gorelab PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
