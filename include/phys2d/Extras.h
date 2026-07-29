@@ -388,7 +388,7 @@ struct SoftNode {
 struct SoftLink {
     int  a = 0, b = 0;
     real restLength = 1.0;
-    real stiffness = 800.0;
+    real stiffness = 400.0;
     real damping = 4.0;
     real breakStrain = 0.0;   // 0 => не рвётся
     bool broken = false;
@@ -487,14 +487,14 @@ struct FluidParticle {
 
 class ParticleSystem : public SimulationSystem {
 public:
-    real smoothingRadius = 0.35;
+    real smoothingRadius = 0.40;
     real restDensity = 1000.0;
     real stiffness = 800.0;        // уравнение состояния
-    real viscosity = 12.0;
-    real surfaceTension = 0.8;
+    real viscosity = 22.0;
+    real surfaceTension = 0.3;
     real particleMass = 1.0;
     Vec2 gravity{0.0, -9.81};
-    real boundaryDamping = 0.4;
+    real boundaryDamping = 0.3;
     AABB domain;
     bool coupleWithRigid = true;
 
@@ -504,6 +504,7 @@ public:
     size_t count() const { return m_particles.size(); }
     const std::vector<FluidParticle>& particles() const { return m_particles; }
     real   surfaceHeight(real x) const;      // волны на поверхности
+    real   wetnessAt(const Vec2& p, real radius) const;  // 0..1 water near a point
     void   update(real dt) override;
     const char* className() const override { return "ParticleSystem"; }
 

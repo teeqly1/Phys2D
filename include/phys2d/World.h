@@ -73,7 +73,13 @@ struct SolverConfig {
     real restitutionThreshold = 1.0;     // порог восстановления (м/с)
     real schlagerFactor       = 0.80;    // метод Шлагера для наложения ограничений
     real velocityTolerance    = 1e-5;    // ранний выход итераций
-    real frictionLoadFactor   = 0.04;    // мю = мю0 / (1 + k * Fn)  — зависимость от нормальной силы
+    real frictionLoadFactor  = 0.0;
+    real stictionSpeed       = 0.05;
+    real warmStartDamping    = 0.92;
+    real maxPenetration      = 0.25;
+    int  maxContactPoints    = 4;
+    real restitutionSpeedRef = 4.0;
+    real restitutionFalloff  = 0.55;
 };
 
 struct MediumConfig {

@@ -1,1547 +1,1418 @@
 // ============================================================================
-//  GoreLab Remake - a People Playground style sandbox built on phys2d.
-//
-//  Two maps, a tool belt, and every major engine subsystem running at once:
-//  rigid bodies, ragdolls with joints, SPH water, blood (wounds / decals /
-//  pools), radial fracture, fire with heat, wind fields and electric current
-//  conducted through the water.
-//
-//  Windows build (MSYS2 MINGW64):
-//    g++ -std=c++17 -O2 -Iinclude examples/gorelab_remake.cpp src/*.cpp \\
-//        -pthread -lgdi32 -luser32 -mwindows -o gorelab_remake.exe
-//  Headless self test (any platform):
-//    g++ -std=c++17 -O2 -DGORELAB_HEADLESS -Iinclude examples/gorelab_remake.cpp \\
-//        src/*.cpp -pthread -o gorelab_test
+// GORELAB REMAKE 2 - People-Playground style sandbox stressing every phys2d
+// subsystem: rigid bodies, joints, CCD, fracture, SPH water, ragdolls, blood,
+// fire, wind, contact events, runtime statistics, software renderer + Win32.
 // ============================================================================
 #include "phys2d/World.h"
 #include "phys2d/Extras.h"
 #include "phys2d/Blood.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdint>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
+#include <memory>
 #include <vector>
+#include <unordered_map>
+
+#if defined(_WIN32) && !defined(GORELAB_HEADLESS)
+#  define GORELAB_WIN 1
+#  include <windows.h>
+#endif
 
 using namespace phys2d;
 
-namespace {
+static inline RigidBody* asBody(RigidBody* b) { return b; }
+static inline RigidBody* asBody(RigidBody& b) { return &b; }
+template <class T> static inline RigidBody* asBody(const std::unique_ptr<T>& p) { return p.get(); }
 
-struct Xor32 {
-    uint32_t s = 0x1BADB002u;
-    uint32_t next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
-    real unit() { return (real)(next() >> 8) / (real)0x00FFFFFF; }
-    real range(real a, real b) { return a + (b - a) * unit(); }
-};
+static uint32_t g_rng = 0x1234567u;
+static inline real rnd01() { g_rng = g_rng * 1664525u + 1013904223u; return (real)((g_rng >> 8) & 0xFFFFFF) / (real)0x1000000; }
+static inline real rnd(real a, real b) { return a + (b - a) * rnd01(); }
+static inline real clampr2(real v, real lo, real hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-enum class Stuff : uint8_t { Ground = 0, Wall, Crate, Wood, Metal, Glass, Shard, Flesh, Bone, Debris };
-
-enum class Tool : uint8_t {
-    Human = 0, Water, Crate, Glass, Metal, Pistol, Shotgun, Rifle, Fire, Grenade, Voltage, Erase
-};
-
-const char* toolName(Tool t) {
-    switch (t) {
-        case Tool::Human:   return "HUMAN (ragdoll)";
-        case Tool::Water:   return "WATER";
-        case Tool::Crate:   return "CRATE";
-        case Tool::Glass:   return "GLASS PANE";
-        case Tool::Metal:   return "STEEL BLOCK";
-        case Tool::Pistol:  return "PISTOL";
-        case Tool::Shotgun: return "SHOTGUN";
-        case Tool::Rifle:   return "AUTO RIFLE";
-        case Tool::Fire:    return "FIRE";
-        case Tool::Grenade: return "FRAG GRENADE";
-        case Tool::Voltage: return "220 V ELECTRODE";
-        case Tool::Erase:   return "ERASE";
+struct Canvas {
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;
+    void resize(int W, int H) { w = W; h = H; px.assign((size_t)W * H, 0xFF000000u); }
+    void clearGradient(int r0, int g0, int b0, int r1, int g1, int b1) {
+        for (int y = 0; y < h; ++y) {
+            real t = (real)y / (real)(h > 1 ? h - 1 : 1);
+            uint32_t c = 0xFF000000u | ((uint32_t)(int)(r0 + (r1 - r0) * t) << 16)
+                       | ((uint32_t)(int)(g0 + (g1 - g0) * t) << 8) | (uint32_t)(int)(b0 + (b1 - b0) * t);
+            uint32_t* row = &px[(size_t)y * w];
+            for (int x = 0; x < w; ++x) row[x] = c;
+        }
     }
-    return "?";
+    inline void blend(int x, int y, int r, int g, int b, real a) {
+        if (a <= 0.0 || x < 0 || y < 0 || x >= w || y >= h) return;
+        if (a > 1.0) a = 1.0;
+        uint32_t& d = px[(size_t)y * w + x];
+        int dr = (int)((d >> 16) & 255), dg = (int)((d >> 8) & 255), db = (int)(d & 255);
+        d = 0xFF000000u | ((uint32_t)(int)(dr + (r - dr) * a) << 16)
+          | ((uint32_t)(int)(dg + (g - dg) * a) << 8) | (uint32_t)(int)(db + (b - db) * a);
+    }
+    inline void add(int x, int y, int r, int g, int b, real a) {
+        if (a <= 0.0 || x < 0 || y < 0 || x >= w || y >= h) return;
+        uint32_t& d = px[(size_t)y * w + x];
+        int nr = std::min(255, (int)((d >> 16) & 255) + (int)(r * a));
+        int ng = std::min(255, (int)((d >> 8) & 255) + (int)(g * a));
+        int nb = std::min(255, (int)(d & 255) + (int)(b * a));
+        d = 0xFF000000u | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+    }
+    void rect(int x0, int y0, int x1, int y1, int r, int g, int b, real a = 1.0) {
+        if (x1 < x0) std::swap(x0, x1);
+        if (y1 < y0) std::swap(y0, y1);
+        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) blend(x, y, r, g, b, a);
+    }
+    void disc(real cx, real cy, real rad, int r, int g, int b, real a = 1.0) {
+        if (rad < 0.4) rad = 0.4;
+        int x0 = (int)std::floor(cx - rad - 1), x1 = (int)std::ceil(cx + rad + 1);
+        int y0 = (int)std::floor(cy - rad - 1), y1 = (int)std::ceil(cy + rad + 1);
+        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+            real dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+            real cov = clampr2(rad + 0.5 - std::sqrt(dx * dx + dy * dy), 0.0, 1.0);
+            if (cov > 0.0) blend(x, y, r, g, b, a * cov);
+        }
+    }
+    void softDisc(real cx, real cy, real rad, int r, int g, int b, real a, bool additive = false) {
+        int x0 = (int)std::floor(cx - rad - 1), x1 = (int)std::ceil(cx + rad + 1);
+        int y0 = (int)std::floor(cy - rad - 1), y1 = (int)std::ceil(cy + rad + 1);
+        real inv = rad > 0.0 ? 1.0 / rad : 0.0;
+        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+            real dx = (x + 0.5 - cx) * inv, dy = (y + 0.5 - cy) * inv;
+            real q = dx * dx + dy * dy;
+            if (q >= 1.0) continue;
+            real f = (1.0 - q) * (1.0 - q);
+            if (additive) add(x, y, r, g, b, a * f); else blend(x, y, r, g, b, a * f);
+        }
+    }
+    void line(real x0, real y0, real x1, real y1, real width, int r, int g, int b, real a = 1.0) {
+        real dx = x1 - x0, dy = y1 - y0;
+        real len = std::sqrt(dx * dx + dy * dy);
+        int steps = (int)(len / std::max((real)0.5, width * 0.4)) + 1;
+        for (int i = 0; i <= steps; ++i) {
+            real t = (real)i / (real)steps;
+            disc(x0 + dx * t, y0 + dy * t, width * 0.5, r, g, b, a);
+        }
+    }
+    void poly(const std::vector<Vec2>& p, int r, int g, int b, real a = 1.0) {
+        if (p.size() < 3) return;
+        real ymin = p[0].y, ymax = p[0].y;
+        for (size_t i = 0; i < p.size(); ++i) { ymin = std::min(ymin, p[i].y); ymax = std::max(ymax, p[i].y); }
+        int y0 = std::max(0, (int)std::floor(ymin)), y1 = std::min(h - 1, (int)std::ceil(ymax));
+        std::vector<real> xs;
+        for (int y = y0; y <= y1; ++y) {
+            real yc = y + 0.5;
+            xs.clear();
+            for (size_t i = 0; i < p.size(); ++i) {
+                const Vec2& A = p[i];
+                const Vec2& B = p[(i + 1) % p.size()];
+                if ((A.y <= yc && B.y > yc) || (B.y <= yc && A.y > yc))
+                    xs.push_back(A.x + (yc - A.y) / (B.y - A.y) * (B.x - A.x));
+            }
+            if (xs.size() < 2) continue;
+            std::sort(xs.begin(), xs.end());
+            for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+                int xa = std::max(0, (int)std::floor(xs[k])), xb = std::min(w - 1, (int)std::ceil(xs[k + 1]));
+                for (int x = xa; x <= xb; ++x) {
+                    real cov = std::min(x + 1.0 - xs[k], xs[k + 1] - x);
+                    if (cov > 0.0) blend(x, y, r, g, b, a * std::min((real)1.0, cov));
+                }
+            }
+        }
+    }
+    void outline(const std::vector<Vec2>& p, real width, int r, int g, int b, real a = 1.0) {
+        for (size_t i = 0; i < p.size(); ++i) {
+            const Vec2& A = p[i];
+            const Vec2& B = p[(i + 1) % p.size()];
+            line(A.x, A.y, B.x, B.y, width, r, g, b, a);
+        }
+    }
+    void glyph(char c, int x, int y, int s, int r, int g, int b, real a);
+    void text(const char* str, int x, int y, int s, int r, int g, int b, real a = 1.0) {
+        int cx = x;
+        for (const char* p = str; *p; ++p) { glyph(*p, cx, y, s, r, g, b, a); cx += 4 * s; }
+    }
+    int textW(const char* str, int s) const { return (int)std::strlen(str) * 4 * s; }
+    void savePpm(const char* path) const {
+        FILE* f = std::fopen(path, "wb");
+        if (!f) return;
+        std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (size_t i = 0; i < px.size(); ++i) {
+            unsigned char rgb[3] = { (unsigned char)((px[i] >> 16) & 255), (unsigned char)((px[i] >> 8) & 255), (unsigned char)(px[i] & 255) };
+            std::fwrite(rgb, 1, 3, f);
+        }
+        std::fclose(f);
+    }
+};
+
+#define GG(a, b, c, d, e) (uint16_t)(((a) << 12) | ((b) << 9) | ((c) << 6) | ((d) << 3) | (e))
+struct Glyph { char c; uint16_t bits; };
+static const Glyph FONT[] = {
+    { '0', GG(7,5,5,5,7) }, { '1', GG(2,6,2,2,7) }, { '2', GG(7,1,7,4,7) }, { '3', GG(7,1,7,1,7) },
+    { '4', GG(5,5,7,1,1) }, { '5', GG(7,4,7,1,7) }, { '6', GG(7,4,7,5,7) }, { '7', GG(7,1,1,1,1) },
+    { '8', GG(7,5,7,5,7) }, { '9', GG(7,5,7,1,7) },
+    { 'A', GG(7,5,7,5,5) }, { 'B', GG(7,5,6,5,7) }, { 'C', GG(7,4,4,4,7) }, { 'D', GG(6,5,5,5,6) },
+    { 'E', GG(7,4,7,4,7) }, { 'F', GG(7,4,7,4,4) }, { 'G', GG(7,4,5,5,7) }, { 'H', GG(5,5,7,5,5) },
+    { 'I', GG(7,2,2,2,7) }, { 'J', GG(1,1,1,5,7) }, { 'K', GG(5,5,6,5,5) }, { 'L', GG(4,4,4,4,7) },
+    { 'M', GG(5,7,7,5,5) }, { 'N', GG(6,5,5,5,5) }, { 'O', GG(7,5,5,5,7) }, { 'P', GG(7,5,7,4,4) },
+    { 'Q', GG(7,5,5,7,1) }, { 'R', GG(7,5,7,6,5) }, { 'S', GG(7,4,7,1,7) }, { 'T', GG(7,2,2,2,2) },
+    { 'U', GG(5,5,5,5,7) }, { 'V', GG(5,5,5,5,2) }, { 'W', GG(5,5,7,7,5) }, { 'X', GG(5,5,2,5,5) },
+    { 'Y', GG(5,5,2,2,2) }, { 'Z', GG(7,1,2,4,7) },
+    { '.', GG(0,0,0,0,2) }, { ',', GG(0,0,0,2,4) }, { '-', GG(0,0,7,0,0) }, { '+', GG(0,2,7,2,0) },
+    { ':', GG(0,2,0,2,0) }, { '/', GG(1,1,2,4,4) }, { '%', GG(5,1,2,4,5) }, { '!', GG(2,2,2,0,2) },
+    { '(', GG(2,4,4,4,2) }, { ')', GG(2,1,1,1,2) }, { '<', GG(1,2,4,2,1) }, { '>', GG(4,2,1,2,4) },
+    { '*', GG(5,2,7,2,5) }, { '=', GG(0,7,0,7,0) }, { '?', GG(7,1,3,0,2) }, { '_', GG(0,0,0,0,7) },
+};
+void Canvas::glyph(char c, int x, int y, int s, int r, int g, int b, real a) {
+    if (c == ' ') return;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    uint16_t bits = 0;
+    bool found = false;
+    for (size_t i = 0; i < sizeof(FONT) / sizeof(FONT[0]); ++i)
+        if (FONT[i].c == c) { bits = FONT[i].bits; found = true; break; }
+    if (!found) return;
+    for (int row = 0; row < 5; ++row) {
+        int rowBits = (bits >> (12 - row * 3)) & 7;
+        for (int col = 0; col < 3; ++col)
+            if (rowBits & (4 >> col))
+                rect(x + col * s, y + row * s, x + col * s + s - 1, y + row * s + s - 1, r, g, b, a);
+    }
 }
 
-enum class MapId : uint8_t { Box = 0, WaterBox = 1 };
+struct Camera {
+    Vec2 center{ 0.0, 8.0 };
+    real ppm = 34.0;
+    int w = 1280, h = 760;
+    Vec2 toScreen(const Vec2& p) const { return Vec2(w * 0.5 + (p.x - center.x) * ppm, h * 0.5 - (p.y - center.y) * ppm); }
+    Vec2 toWorld(real sx, real sy) const { return Vec2(center.x + (sx - w * 0.5) / ppm, center.y - (sy - h * 0.5) / ppm); }
+};
 
-struct Flame  { Vec2 pos, vel; real life = 0.0, maxLife = 1.0, size = 0.10; bool smoke = false; };
-struct Spark  { Vec2 pos, vel; real life = 0.0, maxLife = 0.5; int r = 255, g = 200, b = 90; };
+struct Input {
+    bool key[256];
+    bool pressed[256];
+    int mx = 0, my = 0, wheel = 0;
+    bool lmb = false, rmb = false, lclick = false, rclick = false;
+    Input() { std::memset(key, 0, sizeof(key)); std::memset(pressed, 0, sizeof(pressed)); }
+    void newFrame() { std::memset(pressed, 0, sizeof(pressed)); lclick = rclick = false; wheel = 0; }
+};
+
+enum class Kind : uint8_t { Ground, Wood, Steel, Glass, Ice, Rubber, Stone, Bomb, Balloon, Human, Debris };
+
+struct Meta {
+    Kind kind = Kind::Wood;
+    real hp = 100.0, maxHp = 100.0;
+    real burn = 0.0, temp = 293.0;
+    bool flammable = false, breakable = false, sharp = false;
+    int  gen = 0, human = -1;
+};
+struct HumanInfo { Ragdoll rag; real hp = 100.0; bool dead = false; };
+struct Ember { Vec2 p, v; real life = 0.0, max = 1.0, heat = 1100.0; };
+struct Spark { Vec2 p, v; real life = 0.0, max = 0.4; int r = 255, g = 210, b = 120; };
 struct Tracer { Vec2 a, b; real life = 0.0; };
-struct Muzzle { Vec2 pos, dir; real life = 0.0; };
+struct Bomb { BodyId id = INVALID_BODY; real fuse = 1.6; };
+struct HitEvent { BodyId a = INVALID_BODY, b = INVALID_BODY; Vec2 point, normal; real impulse = 0.0, speed = 0.0; };
 
-struct HitResult {
-    bool   hit = false;
-    Vec2   point, normal;
-    BodyId body = INVALID_BODY;
-    real   distance = 0.0;
+static Material matOf(Kind k) {
+    Material m;
+    switch (k) {
+        case Kind::Wood:    m.density = 550;  m.restitution = 0.22; m.staticFriction = 0.74; m.dynamicFriction = 0.60; break;
+        case Kind::Steel:   m.density = 7850; m.restitution = 0.30; m.staticFriction = 0.58; m.dynamicFriction = 0.45; break;
+        case Kind::Glass:   m.density = 2500; m.restitution = 0.14; m.staticFriction = 0.52; m.dynamicFriction = 0.42; break;
+        case Kind::Ice:     m.density = 917;  m.restitution = 0.16; m.staticFriction = 0.09; m.dynamicFriction = 0.06; break;
+        case Kind::Rubber:  m.density = 1100; m.restitution = 0.82; m.staticFriction = 0.98; m.dynamicFriction = 0.88; break;
+        case Kind::Stone:   m.density = 2400; m.restitution = 0.18; m.staticFriction = 0.80; m.dynamicFriction = 0.68; break;
+        case Kind::Bomb:    m.density = 1400; m.restitution = 0.24; m.staticFriction = 0.70; m.dynamicFriction = 0.55; break;
+        case Kind::Balloon: m.density = 8;    m.restitution = 0.55; m.staticFriction = 0.40; m.dynamicFriction = 0.30; break;
+        case Kind::Human:   m.density = 1050; m.restitution = 0.10; m.staticFriction = 0.95; m.dynamicFriction = 0.85; break;
+        case Kind::Debris:  m.density = 2500; m.restitution = 0.20; m.staticFriction = 0.60; m.dynamicFriction = 0.48; break;
+        default:            m.density = 2400; m.restitution = 0.20; m.staticFriction = 0.85; m.dynamicFriction = 0.72; break;
+    }
+    m.linearDrag = 0.04; m.quadraticDrag = 0.05; m.rollingFriction = 0.03; m.hysteresis = 0.18;
+    return m;
+}
+
+static void colorOfKind(Kind k, real burn, int& r, int& g, int& b) {
+    switch (k) {
+        case Kind::Wood:    r = 168; g = 118; b = 62;  break;
+        case Kind::Steel:   r = 150; g = 158; b = 172; break;
+        case Kind::Glass:   r = 150; g = 210; b = 226; break;
+        case Kind::Ice:     r = 178; g = 224; b = 240; break;
+        case Kind::Rubber:  r = 58;  g = 58;  b = 66;  break;
+        case Kind::Stone:   r = 122; g = 122; b = 118; break;
+        case Kind::Bomb:    r = 178; g = 62;  b = 48;  break;
+        case Kind::Balloon: r = 226; g = 88;  b = 150; break;
+        case Kind::Human:   r = 214; g = 176; b = 148; break;
+        case Kind::Debris:  r = 140; g = 186; b = 200; break;
+        default:            r = 74;  g = 78;  b = 88;  break;
+    }
+    if (burn > 0.0) {
+        real t = clampr2(burn, 0.0, 1.0);
+        r = (int)(r * (1.0 - t) + 46 * t);
+        g = (int)(g * (1.0 - t) + 34 * t);
+        b = (int)(b * (1.0 - t) + 30 * t);
+    }
+}
+
+struct WeaponSpec { const char* name; int pellets; real spread, speed, damage, impulse, cooldown; bool ignite, lobbed; };
+static const WeaponSpec WEAPONS[] = {
+    { "PISTOL",   1, 0.014, 380.0,  9.0, 0.26, 0.28, false, false },
+    { "SHOTGUN",  9, 0.150, 420.0,  7.0, 0.80, 0.85, false, false },
+    { "RIFLE",    1, 0.020, 780.0, 14.0, 0.09, 0.09, false, false },
+    { "GRENADE",  1, 0.000,  24.0,  0.0, 0.00, 1.00, false, true  },
+    { "FLAME",    5, 0.220,  13.0,  1.1, 0.02, 0.05, true,  false },
+    { "GRAVGUN",  0, 0.000,   0.0,  0.0, 0.00, 0.00, false, false },
+    { "SPAWNER",  0, 0.000,   0.0,  0.0, 0.00, 0.00, false, false },
 };
+static const int WEAPON_COUNT = (int)(sizeof(WEAPONS) / sizeof(WEAPONS[0]));
 
-struct WeaponSpec {
-    const char* name;
-    int  pellets;
-    real spread, speed, damage, impulse, cooldown, range;
-    bool automatic;
-};
+enum SpawnKind { SP_CRATE = 0, SP_STEEL, SP_GLASS, SP_ICE, SP_BALL, SP_STONE, SP_BOMB, SP_DOMINO,
+                 SP_BALLOON, SP_HUMAN, SP_WATER, SP_PLANK, SP_WHEEL, SP_CHAIN, SP_COUNT };
+static const char* SPAWN_NAMES[SP_COUNT] = { "CRATE", "STEEL BOX", "GLASS", "ICE BLOCK", "BALL", "BOULDER",
+    "BOMB", "DOMINO", "BALLOON", "HUMAN", "WATER", "PLANK", "WHEEL", "CHAIN" };
 
-const WeaponSpec WEAPON_PISTOL  = {"pistol",  1, 0.012, 380.0, 0.45,  9.0, 0.26,  60.0, false};
-const WeaponSpec WEAPON_SHOTGUN = {"shotgun", 9, 0.150, 420.0, 0.34, 11.0, 0.80,  28.0, false};
-const WeaponSpec WEAPON_RIFLE   = {"rifle",   1, 0.020, 780.0, 0.60, 14.0, 0.085, 90.0, true};
+struct Game {
+    World world;
+    FractureSystem frac;
+    ParticleSystem water;
+    BloodSystem    blood;
+    CcdSystem      ccd;
 
-// ============================================================ water current
-// Voltage in a puddle: every SPH particle is a node, neighbours within
-// linkRadius form resistors (G = A / (rho * L)), electrodes pin the potential
-// and the field is relaxed with Gauss-Seidel. Anything standing in energised
-// water is shocked; dry ground stays safe.
-struct Electrode { Vec2 position; real voltage = 220.0; real radius = 0.30; bool ground = false; };
-struct ShockEvent { BodyId body = INVALID_BODY; real voltage = 0.0, current = 0.0, power = 0.0; Vec2 point; };
-
-class WaterCurrent {
-public:
-    ParticleSystem* fluid = nullptr;
-    World*          world = nullptr;
-    real resistivity     = 20.0;    // ohm*m, tap water
-    real linkRadius      = 0.9;     // must comfortably exceed particle spacing
-    real crossSection    = 0.03;
-    real bodyResistance  = 1200.0;
-    int  relaxIterations = 40;
-    size_t maxPinnedNodes = 10;     // a rod is a rod, not half the pool
-
-    void addElectrode(const Electrode& e) { m_electrodes.push_back(e); }
-    void clearElectrodes() {
-        m_electrodes.clear(); m_shocks.clear();
-        m_pos.clear(); m_volt.clear(); m_fixed.clear(); m_links.clear();
-        m_current = m_power = 0.0;
-    }
-    const std::vector<Electrode>&  electrodes()   const { return m_electrodes; }
-    const std::vector<ShockEvent>& shocks()       const { return m_shocks; }
-    const std::vector<real>&       nodeVoltages() const { return m_volt; }
-    size_t wetNodeCount()    const { return m_pos.size(); }
-    real   totalCurrent()    const { return m_current; }
-    real   dissipatedPower() const { return m_power; }
-
-    void update(real dt) {
-        m_shocks.clear();
-        m_current = m_power = 0.0;
-        if (!fluid || m_electrodes.empty()) { m_pos.clear(); m_volt.clear(); return; }
-        buildGraph();
-        if (m_pos.empty()) return;
-        pinElectrodes();
-        solveField();
-        collectShocks(dt);
-        if (std::getenv("GORELAB_ELEC_DEBUG")) {
-            size_t hot = 0, cold = 0, bnd = 0;
-            for (size_t i = 0; i < m_pos.size(); ++i)
-                if (m_fixed[i]) { (m_volt[i] > 1.0 ? hot : cold)++; }
-            for (const Link& L : m_links)
-                if ((m_fixed[L.a] != 0) != (m_fixed[L.b] != 0)) ++bnd;
-            std::fprintf(stderr, "[elec] nodes=%zu links=%zu hot=%zu cold=%zu bnd=%zu I=%.4f P=%.1f shocks=%zu\\n",
-                         m_pos.size(), m_links.size(), hot, cold, bnd, m_current, m_power, m_shocks.size());
-        }
-    }
-
-private:
-    struct Link { int a = 0, b = 0; real g = 0.0; };
-    static uint64_t key(int64_t gx, int64_t gy) {
-        return ((uint64_t)(gx + 0x20000000) << 32) ^ (uint64_t)(gy + 0x20000000);
-    }
-
-    void buildGraph() {
-        const std::vector<FluidParticle>& ps = fluid->particles();
-        m_pos.clear(); m_links.clear();
-        m_pos.reserve(ps.size());
-        for (const FluidParticle& q : ps)
-            if (q.active && std::isfinite(q.position.x) && std::isfinite(q.position.y))
-                m_pos.push_back(q.position);
-        m_volt.assign(m_pos.size(), 0.0);
-        m_fixed.assign(m_pos.size(), 0);
-        if (m_pos.empty()) return;
-
-        const real cell = linkRadius;
-        std::unordered_map<uint64_t, std::vector<int>> grid;
-        grid.reserve(m_pos.size());
-        for (int i = 0; i < (int)m_pos.size(); ++i)
-            grid[key((int64_t)std::floor(m_pos[i].x / cell),
-                     (int64_t)std::floor(m_pos[i].y / cell))].push_back(i);
-
-        const real r2 = linkRadius * linkRadius;
-        std::vector<int> degree(m_pos.size(), 0);
-        const int maxDegree = 12;                 // dense clumps must not explode the graph
-        for (int i = 0; i < (int)m_pos.size(); ++i) {
-            if (degree[i] >= maxDegree) continue;
-            const int64_t gx = (int64_t)std::floor(m_pos[i].x / cell);
-            const int64_t gy = (int64_t)std::floor(m_pos[i].y / cell);
-            for (int ox = -1; ox <= 1 && degree[i] < maxDegree; ++ox)
-                for (int oy = -1; oy <= 1 && degree[i] < maxDegree; ++oy) {
-                    auto it = grid.find(key(gx + ox, gy + oy));
-                    if (it == grid.end()) continue;
-                    for (int j : it->second) {
-                        if (j <= i || degree[i] >= maxDegree || degree[j] >= maxDegree) continue;
-                        const real d2 = distanceSq(m_pos[i], m_pos[j]);
-                        if (d2 > r2 || d2 < 1e-9) continue;
-                        Link L;
-                        L.a = i; L.b = j;
-                        L.g = crossSection / (resistivity * std::max((real)0.02, std::sqrt(d2)));
-                        m_links.push_back(L);
-                        ++degree[i]; ++degree[j];
-                    }
-                }
-        }
-    }
-
-    // Only a handful of nodes per rod: pinning a whole clump would leave no
-    // potential gradient and therefore no current at all.
-    int pinNear(const Electrode& e, bool onlyFree) {
-        std::vector<std::pair<real, int>> cand;
-        int nearest = -1;
-        real bestD = 1e30;
-        for (int i = 0; i < (int)m_pos.size(); ++i) {
-            if (onlyFree && m_fixed[i]) continue;
-            const real d = distance(m_pos[i], e.position);
-            if (d < bestD) { bestD = d; nearest = i; }
-            if (d <= e.radius) cand.push_back(std::make_pair(d, i));
-        }
-        // An electrode held just above the surface still energises the pool.
-        if (cand.empty() && nearest >= 0 && bestD < 3.0)
-            cand.push_back(std::make_pair(bestD, nearest));
-        std::sort(cand.begin(), cand.end());
-        const size_t take = std::min<size_t>(maxPinnedNodes, cand.size());
-        for (size_t k = 0; k < take; ++k) {
-            m_volt[cand[k].second] = e.voltage;
-            m_fixed[cand[k].second] = 1;
-        }
-        return (int)take;
-    }
-
-    // Live rods win, earth rods may only claim still-free nodes, so one
-    // electrode can never overwrite another and short the pool out.
-    void pinElectrodes() {
-        for (const Electrode& e : m_electrodes)
-            if (!e.ground) pinNear(e, false);
-
-        Vec2 liveCenter;
-        int liveCount = 0;
-        for (size_t i = 0; i < m_pos.size(); ++i)
-            if (m_fixed[i] && m_volt[i] > 1.0) { liveCenter += m_pos[i]; ++liveCount; }
-        if (liveCount > 0) liveCenter *= (real)1.0 / (real)liveCount;
-
-        for (const Electrode& e : m_electrodes) {
-            if (!e.ground) continue;
-            if (pinNear(e, true) > 0 || liveCount == 0) continue;
-            // No water near the earth rod: earth the far end of the pool so the
-            // current still has to cross the whole thing.
-            std::vector<std::pair<real, int>> byDist;
-            for (int i = 0; i < (int)m_pos.size(); ++i)
-                if (!m_fixed[i]) byDist.push_back(std::make_pair(distanceSq(m_pos[i], liveCenter), i));
-            std::sort(byDist.begin(), byDist.end(),
-                      [](const std::pair<real, int>& a, const std::pair<real, int>& b) {
-                          return a.first > b.first;
-                      });
-            const size_t take = std::min<size_t>(maxPinnedNodes, byDist.size());
-            for (size_t k = 0; k < take; ++k) {
-                m_volt[byDist[k].second] = e.voltage;
-                m_fixed[byDist[k].second] = 1;
-            }
-        }
-    }
-
-    void solveField() {
-        const size_t n = m_pos.size();
-        std::vector<real> num(n, 0.0), den(n, 0.0);
-        for (int it = 0; it < relaxIterations; ++it) {
-            std::fill(num.begin(), num.end(), 0.0);
-            std::fill(den.begin(), den.end(), 0.0);
-            for (const Link& L : m_links) {
-                num[L.a] += L.g * m_volt[L.b]; den[L.a] += L.g;
-                num[L.b] += L.g * m_volt[L.a]; den[L.b] += L.g;
-            }
-            for (size_t i = 0; i < n; ++i) {
-                if (m_fixed[i] || den[i] <= 0.0) continue;
-                m_volt[i] += 0.9 * (num[i] / den[i] - m_volt[i]);
-            }
-        }
-        for (const Link& L : m_links) {
-            const real dv = m_volt[L.a] - m_volt[L.b];
-            const bool fa = m_fixed[L.a] != 0, fb = m_fixed[L.b] != 0;
-            if (fa != fb) {
-                const bool srcHigher = fa ? (m_volt[L.a] > m_volt[L.b]) : (m_volt[L.b] > m_volt[L.a]);
-                if (srcHigher) m_current += std::fabs(L.g * dv);
-            }
-            m_power += L.g * dv * dv;
-        }
-    }
-
-    void collectShocks(real) {
-        if (!world) return;
-        for (RigidBody* b : world->bodies()) {
-            if (!b->isDynamic()) continue;
-            real best = 0.0;
-            Vec2 where = b->position;
-            for (size_t i = 0; i < m_pos.size(); ++i) {
-                if (m_volt[i] <= 1.0 || m_volt[i] <= best) continue;
-                const Vec2& p = m_pos[i];
-                // Distance to the AABB: a big slab cannot cheat its way to a shock.
-                const real dx = std::max(std::max(b->aabb.min.x - p.x, (real)0.0), p.x - b->aabb.max.x);
-                const real dy = std::max(std::max(b->aabb.min.y - p.y, (real)0.0), p.y - b->aabb.max.y);
-                if (dx * dx + dy * dy > 0.09) continue;
-                best = m_volt[i];
-                where = p;
-            }
-            if (best > 1.0) {
-                ShockEvent s;
-                s.body = b->id; s.voltage = best;
-                s.current = best / bodyResistance;
-                s.power = s.voltage * s.current;
-                s.point = where;
-                m_shocks.push_back(s);
-            }
-        }
-    }
-
-    std::vector<Vec2>       m_pos;
-    std::vector<real>       m_volt;
-    std::vector<uint8_t>    m_fixed;
-    std::vector<Link>       m_links;
-    std::vector<Electrode>  m_electrodes;
-    std::vector<ShockEvent> m_shocks;
-    real m_current = 0.0, m_power = 0.0;
-};
-
-} // namespace
-
-// ============================================================ the game
-class GoreLab {
-public:
-    World               world;
-    ParticleSystem      fluid;
-    BloodSystem         blood;
-    BodyPhysicsRegistry registry;
-    ThermalSystem       thermal;
-    FieldSystem         field;
-    FractureSystem      fracture;
-    WaterCurrent        elec;
-
-    MapId map  = MapId::Box;
-    Tool  tool = Tool::Human;
-    bool  paused = false, slowMotion = false, turbo = false, stepOnce = false;
-    bool  showWater = true;
-    real  windStrength = 0.0, simTime = 0.0;
-    int   ragdollCount = 0, shotsFired = 0, kills = 0;
-
-    std::unordered_map<BodyId, Stuff> stuffOf;
-    std::unordered_set<BodyId>        fleshParts;
-    std::unordered_map<BodyId, real>  burning, health, propDamage;
-    std::vector<Flame>  flames;
+    std::unordered_map<BodyId, Meta> meta;
+    std::vector<HumanInfo> humans;
+    std::vector<Ember>  embers;
     std::vector<Spark>  sparks;
     std::vector<Tracer> tracers;
-    std::vector<Muzzle> muzzles;
-    std::vector<BodyId> pendingShatter;
-    std::vector<Vec2>   pendingShatterPt, pendingShatterDir;
-    std::unordered_set<uint64_t> waterCells;
+    std::vector<Bomb>   bombs;
+    std::vector<HitEvent> hits;
+    std::vector<BodyId> doomed;
+    struct Boom { Vec2 c; real power, radius; };
+    std::vector<Boom> pendingBooms;
 
-    BodyId dragBody = INVALID_BODY;
-    Vec2   dragLocal, dragTarget, aimPoint;
-    real   fireCooldown = 0.0;
-    Xor32  rng;
+    int  map = 1;
+    real wind = 0.0, gustAmp = 3.0, windTime = 0.0;
+    real gravityMul = 1.0;
+    int  weapon = 0, spawnSel = SP_CRATE;
+    real cooldown = 0.0;
+    int  shots = 0, kills = 0, cuts = 0, fractures = 0;
+    real waterSpacing = 0.20;
+    size_t waterCap = 6000;
+    BodyId held = INVALID_BODY;
+    real timeScale = 1.0;
+    bool paused = false, showDebug = false, showBlood = true;
+    real fps = 0.0, stepMs = 0.0, simTime = 0.0;
 
-    real arenaLeft = -16.0, arenaRight = 16.0, arenaFloor = 0.0, arenaTop = 18.0;
+    Meta* metaOf(BodyId id) {
+        std::unordered_map<BodyId, Meta>::iterator it = meta.find(id);
+        return it == meta.end() ? nullptr : &it->second;
+    }
 
-    GoreLab() { buildSystems(); loadMap(MapId::Box); }
+    BodyId add(Kind k, const Shape& s, const Vec2& p, real angle = 0.0,
+               BodyType type = BodyType::Dynamic, real hp = -1.0) {
+        BodyDef d;
+        d.type = type;
+        d.shape = s;
+        d.material = matOf(k);
+        d.position = p;
+        d.angle = angle;
+        if (k == Kind::Balloon) d.gravityScale = -0.55;
+        BodyId id = world.createBody(d);
+        Meta m;
+        m.kind = k;
+        m.hp = m.maxHp = (hp > 0.0 ? hp : (k == Kind::Glass ? 22.0 : (k == Kind::Wood ? 55.0 : (k == Kind::Steel ? 260.0 : 80.0))));
+        m.flammable = (k == Kind::Wood || k == Kind::Human || k == Kind::Balloon);
+        m.breakable = (k == Kind::Glass || k == Kind::Ice || k == Kind::Stone);
+        m.sharp = (k == Kind::Glass || k == Kind::Debris);
+        meta[id] = m;
+        if (m.breakable) frac.makeBreakable(id, k == Kind::Glass ? 14.0 : 34.0);
+        return id;
+    }
 
-    void buildSystems() {
+    void init() {
         WorldConfig& cfg = world.config();
         cfg.gravity = Vec2(0.0, -9.81);
-        cfg.solver.velocityIterations = 10;
-        cfg.solver.positionIterations = 8;
-        cfg.substeps = 3;
-        world.enableModule(MOD_TOI, true);          // no bullets through walls
-        world.enableModule(MOD_SLEEPING, true);
+        cfg.solver.velocityIterations = 14;
+        cfg.solver.positionIterations = 10;
+        cfg.substeps = 4;
+        cfg.gridCellSize = 1.6;
+        cfg.aabbMargin = 0.08;
 
-        fluid.attach(world);
-        // Spacing must sit at ~0.8 of the smoothing radius or the pool explodes.
-        fluid.smoothingRadius = 0.45;
-        fluid.particleMass    = 1.4;
-        fluid.restDensity     = 1000.0;
-        fluid.stiffness       = 420.0;
-        fluid.viscosity       = 22.0;
-        fluid.surfaceTension  = 1.0;
-
+        frac.attach(world);
+        water.attach(world);
         blood.attach(world);
+        ccd.attach(world);
+
+        frac.pieces = 6;
+        frac.impulseThreshold = 14.0;
+        frac.maxFragmentsPerStep = 24;
+        frac.minFragmentArea = 0.010;
+        frac.maxGeneration = 2;
+        frac.setCallback([this](const FractureEvent& e) { this->onFracture(e); });
+
+        water.smoothingRadius = waterSpacing * 2.0;
+        water.restDensity = 1000.0;
+        water.particleMass = 1000.0 * waterSpacing * waterSpacing;
+        water.stiffness = 400.0;
+        water.viscosity = 22.0;
+        water.surfaceTension = 0.3;
+        water.boundaryDamping = 0.3;
+        water.coupleWithRigid = true;
+        water.domain = AABB{ Vec2(-16.4, 0.03), Vec2(16.4, 24.0) };
+
+        blood.groundLevel = 0.0;
         blood.enablePools = true;
-        blood.maxDroplets = 7000;
-        blood.maxDecals   = 3000;
-        blood.maxWounds   = 180;
+        blood.enableCastOff = true;
+        blood.stainBodies = true;
+        blood.maxDroplets = 9000;
+        blood.maxDecals = 2600;
+        blood.maxPools = 420;
 
-        thermal.attach(world);
-        thermal.registry = &registry;
-        thermal.frictionHeating = 0.3;
+        ccd.speedThreshold = 5.0;
+        ccd.maxSubsteps = 8;
 
-        field.attach(world);
-        field.registry = &registry;
-        field.flags = FIELD_WIND;
-        field.windBase = Vec2(0.0, 0.0);
-        field.windTurbulence = 2.5;
-        field.maxWindAcceleration = 300.0;
-
-        fracture.attach(world);
-        fracture.pieces = 7;
-        fracture.impulseThreshold = 14.0;
-        fracture.maxFragmentsPerStep = 40;
-        fracture.minFragmentArea = 0.004;
-
-        elec.fluid = &fluid;
-        elec.world = &world;
-
-        world.setBeginContactCallback([this](const CollisionEvent& e) { onContact(e); });
-        world.setPersistContactCallback([this](const CollisionEvent& e) { onPersist(e); });
+        world.setPersistContactCallback([this](const CollisionEvent& e) { this->onContact(e); });
+        world.setBeginContactCallback([this](const CollisionEvent& e) { this->onContact(e); });
     }
 
-    // ------------------------------------------------------------ maps
-    void loadMap(MapId id) {
-        map = id;
-        world.clear(); fluid.clear(); blood.clear(); elec.clearElectrodes();
-        stuffOf.clear(); fleshParts.clear(); burning.clear(); health.clear();
-        propDamage.clear(); flames.clear(); sparks.clear(); tracers.clear();
-        muzzles.clear(); registry.all().clear(); waterCells.clear();
-        pendingShatter.clear(); pendingShatterPt.clear(); pendingShatterDir.clear();
-        ragdollCount = shotsFired = kills = 0;
-        simTime = 0.0;
-        dragBody = INVALID_BODY;
-        blood.groundLevel = arenaFloor;
-
-        makeWall(Vec2(0.0, arenaFloor - 0.5), 34.0, 1.0, Stuff::Ground);
-        makeWall(Vec2(arenaLeft - 0.5, 9.0), 1.0, 18.0, Stuff::Wall);
-        makeWall(Vec2(arenaRight + 0.5, 9.0), 1.0, 18.0, Stuff::Wall);
-        makeWall(Vec2(0.0, arenaTop + 0.5), 34.0, 1.0, Stuff::Wall);   // lid
-        // Kept clear of the static slabs: a particle inside one would be pushed
-        // out by that slab's bounding radius and fly across the arena.
-        fluid.domain = AABB(Vec2(arenaLeft + 0.45, arenaFloor + 0.35),
-                            Vec2(arenaRight - 0.45, arenaTop - 1.2));
-
-        if (id == MapId::WaterBox) {
-            fluid.emitBlock(Vec2(-8.0, arenaFloor + 0.45), 16.0, 2.0, 0.32);
-            makeWall(Vec2(-9.0, 6.6), 7.0, 0.4, Stuff::Wood);   // diving board
-            makeCrate(Vec2(-11.0, 7.4), 0.9);
-            makeCrate(Vec2(-10.0, 7.4), 0.9);
-        } else {
-            makeWall(Vec2(7.0, 3.0), 6.0, 0.4, Stuff::Wood);    // shelf
-            for (int i = 0; i < 4; ++i) makeCrate(Vec2(6.0 + i * 1.05, 3.8), 0.9);
-            makeGlassPane(Vec2(-6.0, 2.0), 0.16, 4.0);
-            makeGlassPane(Vec2(-3.0, 2.0), 0.16, 4.0);
-            makeMetalBlock(Vec2(2.5, 1.0), 0.9);
-        }
-        spawnRagdoll(Vec2(0.0, 5.0));
-    }
-
-    // ------------------------------------------------------------ builders
-    BodyId tag(BodyId id, Stuff s) { if (id != INVALID_BODY) stuffOf[id] = s; return id; }
-    Stuff  stuff(BodyId id) const {
-        auto it = stuffOf.find(id);
-        return (it == stuffOf.end()) ? Stuff::Debris : it->second;
-    }
-
-    BodyId makeWall(const Vec2& c, real w, real h, Stuff s) {
-        BodyDef d;
-        d.type = BodyType::Static;
-        d.shape = Shape::box(w, h);
-        d.position = c;
-        d.material.staticFriction = 0.7;
-        d.material.dynamicFriction = 0.55;
-        d.material.restitution = 0.05;
-        d.name = "wall";
-        return tag(world.createBody(d), s);
-    }
-
-    BodyId makeCrate(const Vec2& c, real size) {
-        BodyDef d;
-        d.shape = Shape::box(size, size);
-        d.position = c;
-        d.material.density = 260.0;
-        d.material.restitution = 0.18;
-        d.material.staticFriction = 0.62;
-        d.material.dynamicFriction = 0.48;
-        d.name = "crate";
-        const BodyId id = world.createBody(d);
-        if (RigidBody* b = world.body(id)) b->computeMassFromShape();
-        fracture.makeBreakable(id, 260.0);
-        registry.ref(id).temperature = 293.0;
-        return tag(id, Stuff::Crate);
-    }
-
-    BodyId makeMetalBlock(const Vec2& c, real size) {
-        BodyDef d;
-        d.shape = Shape::box(size, size * 0.7);
-        d.position = c;
-        d.material.density = 7800.0;
-        d.material.restitution = 0.10;
-        d.material.staticFriction = 0.55;
-        d.name = "steel";
-        const BodyId id = world.createBody(d);
-        if (RigidBody* b = world.body(id)) b->computeMassFromShape();
-        registry.ref(id).conductivity = 120.0;
-        return tag(id, Stuff::Metal);
-    }
-
-    BodyId makeGlassPane(const Vec2& c, real w, real h) {
-        BodyDef d;
-        d.shape = Shape::box(w, h);
-        d.position = c;
-        d.material.density = 2500.0;
-        d.material.restitution = 0.05;
-        d.material.staticFriction = 0.4;
-        d.name = "glass";
-        const BodyId id = world.createBody(d);
-        if (RigidBody* b = world.body(id)) b->computeMassFromShape();
-        fracture.makeBreakable(id, 10.0);
-        return tag(id, Stuff::Glass);
-    }
-
-    void spawnRagdoll(const Vec2& at) {
-        RagdollConfig rc;
-        rc.position = at;
-        rc.scale = 1.0;
-        rc.density = 1050.0;              // human tissue
-        rc.jointFriction = 0.08;
-        Ragdoll r = createRagdoll(world, rc);
-        for (BodyId p : r.parts) {
-            if (p == INVALID_BODY) continue;
-            tag(p, (p == r.head) ? Stuff::Bone : Stuff::Flesh);
-            fleshParts.insert(p);
-            BodyPhysics& bp = registry.ref(p);
-            bp.temperature = 310.0;       // 37 C
-            bp.heatCapacity = 3500.0;
-            bp.meltingPoint = 600.0;
-            if (RigidBody* b = world.body(p)) {
-                b->material.restitution = 0.05;
-                b->material.staticFriction = 0.85;
-                b->material.dynamicFriction = 0.7;
-            }
-        }
-        if (r.torso != INVALID_BODY) health[r.torso] = 100.0;
-        ++ragdollCount;
-    }
-
-    // ------------------------------------------------------------ queries
-    HitResult rayCast(const Vec2& origin, const Vec2& dir, real maxDist,
-                      BodyId ignore = INVALID_BODY) {
-        HitResult res;
-        const Vec2 d = dir.normalized();
-        Vec2 from = origin + d * 0.02;
-        const Vec2 to = origin + d * maxDist;
-        for (int guard = 0; guard < 3; ++guard) {
-            RayHit hit;
-            if (!rayCastClosest(world, from, to, hit) || !hit.body) return res;
-            if (hit.body->id == ignore) { from = hit.point + d * 0.08; continue; }
-            res.hit = true;
-            res.body = hit.body->id;
-            res.point = hit.point;
-            res.normal = hit.normal;
-            res.distance = distance(origin, hit.point);
-            return res;
-        }
-        return res;
-    }
-
-    // Water occupancy grid: "is this wet?" in O(1) instead of a full scan.
-    static constexpr real WATER_CELL = 0.5;
-    static uint64_t wcell(int64_t gx, int64_t gy) {
-        return ((uint64_t)(gx + 0x20000000) << 32) ^ (uint64_t)(gy + 0x20000000);
-    }
-    void rebuildWaterGrid() {
-        waterCells.clear();
-        for (const FluidParticle& q : fluid.particles()) {
-            if (!q.active) continue;
-            if (!std::isfinite(q.position.x) || !std::isfinite(q.position.y)) continue;
-            waterCells.insert(wcell((int64_t)std::floor(q.position.x / WATER_CELL),
-                                    (int64_t)std::floor(q.position.y / WATER_CELL)));
-        }
-    }
-    bool inWater(const Vec2& p, real radius) const {
-        if (waterCells.empty()) return false;
-        const int span = std::max(1, (int)std::ceil(radius / WATER_CELL));
-        const int64_t gx = (int64_t)std::floor(p.x / WATER_CELL);
-        const int64_t gy = (int64_t)std::floor(p.y / WATER_CELL);
-        for (int ox = -span; ox <= span; ++ox)
-            for (int oy = -span; oy <= span; ++oy)
-                if (waterCells.count(wcell(gx + ox, gy + oy))) return true;
-        return false;
-    }
-
-    // ------------------------------------------------------------ tools
-    void useTool(const Vec2& at, const Vec2& aimFrom) {
-        switch (tool) {
-            case Tool::Human:   spawnRagdoll(at); break;
-            case Tool::Water:   pourWater(at); break;
-            case Tool::Crate:   makeCrate(at, 0.9); break;
-            case Tool::Glass:   makeGlassPane(at, 0.16, 3.0); break;
-            case Tool::Metal:   makeMetalBlock(at, 0.9); break;
-            case Tool::Pistol:  shoot(aimFrom, at, WEAPON_PISTOL); break;
-            case Tool::Shotgun: shoot(aimFrom, at, WEAPON_SHOTGUN); break;
-            case Tool::Rifle:   shoot(aimFrom, at, WEAPON_RIFLE); break;
-            case Tool::Fire:    igniteAt(at, 0.9); break;
-            case Tool::Grenade: throwGrenade(at); break;
-            case Tool::Voltage: placeElectrode(at); break;
-            case Tool::Erase:   eraseAt(at); break;
-        }
-    }
-
-    void pourWater(const Vec2& at) {
-        if (fluid.count() > 3500) return;          // keep it real time
-        for (int i = 0; i < 5; ++i)
-            fluid.emit(at + Vec2(rng.range(-0.3, 0.3), rng.range(-0.3, 0.3)),
-                       Vec2(rng.range(-0.4, 0.4), rng.range(-1.2, 0.0)));
-    }
-
-    // The rod snaps onto the water, the earth rod goes to the far end of the
-    // same pool, so the current has to cross the whole puddle.
-    void placeElectrode(const Vec2& at) {
-        elec.clearElectrodes();
-        Vec2 live = at, ground(arenaRight - 1.0, arenaFloor + 0.3);
-        real best = 1e30;
-        bool found = false;
-        for (const FluidParticle& q : fluid.particles()) {
-            if (!q.active) continue;
-            const real d = distanceSq(q.position, at);
-            if (d < best) { best = d; live = q.position; found = true; }
-        }
-        if (found) {
-            real far = -1.0;
-            for (const FluidParticle& q : fluid.particles()) {
-                if (!q.active) continue;
-                const real d = distanceSq(q.position, live);
-                if (d > far) { far = d; ground = q.position; }
-            }
-        }
-        elec.addElectrode(Electrode{live, 220.0, 0.30, false});
-        elec.addElectrode(Electrode{ground, 0.0, 0.30, true});
-    }
-
-    void eraseAt(const Vec2& at) {
-        if (RigidBody* b = world.queryPoint(at)) {
-            if (b->isStatic()) return;
-            removeBody(b->id);
-        }
-    }
-
-    void removeBody(BodyId id) {
+    void forget(BodyId id) {
         blood.forgetBody(id);
-        stuffOf.erase(id); fleshParts.erase(id); burning.erase(id);
-        health.erase(id); propDamage.erase(id);
-        registry.remove(id);
-        if (dragBody == id) dragBody = INVALID_BODY;
-        world.destroyBody(id);
+        meta.erase(id);
+        for (size_t k = 0; k < bombs.size(); ++k)
+            if (bombs[k].id == id) { bombs[k] = bombs.back(); bombs.pop_back(); break; }
     }
 
-    void damageProp(BodyId id, real amount) {
-        if (amount <= 0.0) return;
-        const Stuff s = stuff(id);
-        if (s == Stuff::Ground || s == Stuff::Wall) return;
-        propDamage[id] += amount;
-    }
-
-    // ------------------------------------------------------------ shooting
-    void shoot(const Vec2& from, const Vec2& target, const WeaponSpec& w) {
-        if (fireCooldown > 0.0) return;
-        fireCooldown = w.cooldown;
-        ++shotsFired;
-        const Vec2 base = (target - from).normalized();
-        muzzles.push_back(Muzzle{from, base, 0.05});
-
-        for (int p = 0; p < w.pellets; ++p) {
-            const real a = std::atan2(base.y, base.x) + rng.range(-w.spread, w.spread);
-            const Vec2 dir(std::cos(a), std::sin(a));
-            Vec2 origin = from;
-            real energy = 1.0;
-            BodyId last = INVALID_BODY;
-            // Penetration: each hit eats energy, the bullet keeps going on the rest.
-            for (int pass = 0; pass < 4 && energy > 0.12; ++pass) {
-                const HitResult h = rayCast(origin, dir, w.range, last);
-                if (!h.hit) { tracers.push_back(Tracer{origin, origin + dir * w.range, 0.0}); break; }
-                tracers.push_back(Tracer{origin, h.point, 0.0});
-                energy = impactBullet(h, dir, w, energy);
-                last = h.body;
-                origin = h.point + dir * 0.06;
-            }
+    void onFracture(const FractureEvent& e) {
+        ++fractures;
+        Meta base;
+        Meta* src = metaOf(e.original);
+        if (src) base = *src;
+        for (size_t i = 0; i < e.fragments.size(); ++i) {
+            Meta m = base;
+            m.gen = base.gen + 1;
+            m.kind = (base.kind == Kind::Glass) ? Kind::Glass : Kind::Debris;
+            m.hp = m.maxHp = std::max((real)4.0, base.maxHp * 0.45);
+            m.sharp = true;
+            m.human = -1;
+            m.breakable = (m.gen < 2);
+            meta[e.fragments[i]] = m;
+            if (m.breakable)
+                frac.makeBreakable(e.fragments[i], (base.kind == Kind::Glass ? 16.0 : 46.0) * (real)(m.gen + 1));
+        }
+        forget(e.original);
+        for (int i = 0; i < 8; ++i) {
+            Spark s;
+            s.p = e.impactPoint;
+            s.v = Vec2(rnd(-3.0, 3.0), rnd(0.0, 4.5));
+            s.max = s.life = rnd(0.15, 0.45);
+            s.r = 210; s.g = 240; s.b = 255;
+            sparks.push_back(s);
         }
     }
 
-    real impactBullet(const HitResult& h, const Vec2& dir, const WeaponSpec& w, real energy) {
-        RigidBody* b = world.body(h.body);
-        if (!b) return 0.0;
-        const Stuff s = stuff(h.body);
-        if (b->isDynamic()) b->applyImpulseAtPoint(dir * (w.impulse * energy), h.point);
-
-        real loss = 0.35;
-        switch (s) {
-            case Stuff::Flesh:
-            case Stuff::Bone: {
-                loss = (s == Stuff::Bone) ? 0.75 : 0.40;
-                const real sev = w.damage * energy;
-                blood.addWound(h.body, h.point, dir * -1.0, sev * 0.7, sev > 0.4);
-                blood.spray(h.point, dir * -1.0, 5.0 + 9.0 * sev, 0.55, (int)(6 + 18 * sev), 0.5, 235);
-                blood.spray(h.point + dir * 0.05, dir, 7.0 + 14.0 * sev, 0.7, (int)(8 + 24 * sev), 0.7, 210);
-                if (sev > 0.5) blood.sever(h.body, h.point, dir, sev);
-                damageHuman(h.body, sev * 60.0);
-                break;
-            }
-            case Stuff::Glass:
-                loss = 0.18;
-                queueShatter(h.body, h.point, dir);
-                break;
-            case Stuff::Crate:
-            case Stuff::Wood:
-                loss = 0.45;
-                emitSparks(h.point, h.normal, 6, 180, 140, 90);
-                damageProp(h.body, w.impulse * energy * 3.0);
-                if (propDamage[h.body] > 55.0) queueShatter(h.body, h.point, dir);
-                break;
-            case Stuff::Metal:
-                loss = 0.85;                           // steel eats the bullet
-                emitSparks(h.point, h.normal, 16, 255, 220, 140);
-                break;
-            default:
-                loss = 0.9;
-                emitSparks(h.point, h.normal, 4, 200, 200, 200);
-                break;
-        }
-        return energy * (1.0 - loss);
-    }
-
-    void damageHuman(BodyId part, real dmg) {
-        RigidBody* hit = world.body(part);
-        if (!hit) return;
-        for (auto& kv : health) {
-            if (kv.second <= 0.0) continue;
-            RigidBody* torso = world.body(kv.first);
-            if (!torso) continue;
-            if (distance(torso->position, hit->position) > 2.2) continue;
-            kv.second -= dmg;
-            if (kv.second <= 0.0) { kv.second = 0.0; ++kills; }
-            return;
-        }
-    }
-
-    void queueShatter(BodyId id, const Vec2& point, const Vec2& dir) {
-        for (BodyId q : pendingShatter) if (q == id) return;
-        pendingShatter.push_back(id);
-        pendingShatterPt.push_back(point);
-        pendingShatterDir.push_back(dir);
-    }
-
-    void throwGrenade(const Vec2& at) {
-        const real R = 5.0;
-        for (RigidBody* b : world.bodies()) {
-            if (!b->isDynamic()) continue;
-            const Vec2 d = b->position - at;
-            const real dist = std::max((real)0.25, d.length());
-            if (dist > R) continue;
-            const real falloff = 1.0 - dist / R;
-            b->applyImpulseAtPoint(d.normalized() * (900.0 * falloff * falloff), b->position);
-            if (fleshParts.count(b->id)) {
-                blood.addWound(b->id, b->position, d.normalized(), falloff, true);
-                blood.spray(b->position, d.normalized(), 12.0 * falloff, 1.2,
-                            (int)(24 * falloff), 0.8, 230);
-                damageHuman(b->id, 90.0 * falloff);
-            }
-            if (stuff(b->id) == Stuff::Glass && falloff > 0.25)
-                queueShatter(b->id, b->position, d.normalized());
-            else
-                damageProp(b->id, 90.0 * falloff);
-        }
-        for (int i = 0; i < 90; ++i) {
-            const real a = rng.range(0.0, 6.2831853);
-            sparks.push_back(Spark{at, Vec2(std::cos(a), std::sin(a)) * rng.range(6.0, 26.0),
-                                   0.0, rng.range(0.25, 0.7), 255, 210, 120});
-        }
-        for (int i = 0; i < 40; ++i) {
-            const real a = rng.range(0.0, 6.2831853);
-            flames.push_back(Flame{at, Vec2(std::cos(a), std::sin(a)) * rng.range(2.0, 9.0),
-                                   0.0, rng.range(0.35, 0.8), rng.range(0.18, 0.4), false});
-        }
-        igniteAt(at, 1.0);
-    }
-
-    void emitSparks(const Vec2& p, const Vec2& n, int count, int r, int g, int b) {
-        for (int i = 0; i < count; ++i) {
-            const real a = std::atan2(n.y, n.x) + rng.range(-1.1, 1.1);
-            sparks.push_back(Spark{p, Vec2(std::cos(a), std::sin(a)) * rng.range(2.5, 11.0),
-                                   0.0, rng.range(0.12, 0.45), r, g, b});
-        }
-    }
-
-    // ------------------------------------------------------------ fire
-    void igniteAt(const Vec2& at, real strength) {
-        for (RigidBody* b : world.bodies()) {
-            if (distance(b->position, at) > 1.0) continue;
-            const Stuff s = stuff(b->id);
-            if (s == Stuff::Metal || s == Stuff::Glass || s == Stuff::Ground || s == Stuff::Wall) continue;
-            if (inWater(b->position, 0.45)) continue;         // wet things do not light
-            burning[b->id] = std::max(burning[b->id], strength);
-        }
-        for (int i = 0; i < 12; ++i)
-            flames.push_back(Flame{at + Vec2(rng.range(-0.3, 0.3), rng.range(-0.2, 0.2)),
-                                   Vec2(rng.range(-0.6, 0.6), rng.range(0.8, 2.4)),
-                                   0.0, rng.range(0.4, 0.9), rng.range(0.12, 0.26), false});
-    }
-
-    void updateFire(real dt) {
-        std::vector<BodyId> extinguished, spreadTo;
-        for (auto& kv : burning) {
-            const BodyId id = kv.first;
-            RigidBody* b = world.body(id);
-            if (!b) { extinguished.push_back(id); continue; }
-
-            if (inWater(b->position, b->boundingRadius + 0.3)) {
-                extinguished.push_back(id);
-                for (int i = 0; i < 5; ++i)                   // steam
-                    flames.push_back(Flame{b->position,
-                                           Vec2(rng.range(-0.5, 0.5), rng.range(0.6, 1.8)),
-                                           0.0, 0.5, 0.16, true});
-                continue;
-            }
-
-            kv.second = std::min((real)1.0, kv.second + 0.25 * dt);
-            const real heat = kv.second;
-            registry.ref(id).temperature += 420.0 * heat * dt;
-
-            if (rng.unit() < heat * 0.85)
-                flames.push_back(Flame{b->position + Vec2(rng.range(-1.0, 1.0), rng.range(-1.0, 1.0)) * b->boundingRadius,
-                                       Vec2(rng.range(-0.7, 0.7) + windStrength * 0.25, rng.range(1.4, 3.4)),
-                                       0.0, rng.range(0.35, 0.85), rng.range(0.10, 0.24), false});
-
-            if (fleshParts.count(id)) {
-                if (rng.unit() < heat * 6.0 * dt) {
-                    blood.addWound(id, b->position + Vec2(rng.range(-0.1, 0.1), rng.range(-0.1, 0.1)),
-                                   Vec2(rng.range(-1.0, 1.0), 1.0), 0.18 * heat, false);
-                    damageHuman(id, 110.0 * heat * dt);
-                }
-            } else {
-                damageProp(id, 26.0 * heat * dt);
-                if (propDamage[id] > 55.0 && stuff(id) != Stuff::Shard)
-                    queueShatter(id, b->position, Vec2(0.0, 1.0));
-            }
-
-            for (RigidBody* o : world.bodies()) {              // radiation spread
-                if (o->id == id || burning.count(o->id)) continue;
-                const Stuff s = stuff(o->id);
-                if (s == Stuff::Metal || s == Stuff::Glass || s == Stuff::Ground || s == Stuff::Wall) continue;
-                if (distance(o->position, b->position) > 0.95) continue;
-                if (inWater(o->position, 0.4)) continue;
-                if (burning.size() + spreadTo.size() < 40 && rng.unit() < 0.10 * dt)
-                    spreadTo.push_back(o->id);
-            }
-        }
-        for (BodyId id : spreadTo) burning[id] = 0.15;
-        for (BodyId id : extinguished) burning.erase(id);
-    }
-
-    void updateFx(real dt) {
-        for (Flame& f : flames) {
-            f.life += dt;
-            f.vel.y += (f.smoke ? 1.2 : 3.4) * dt;
-            f.vel.x += windStrength * 0.35 * dt;
-            f.vel *= 0.985;
-            f.pos += f.vel * dt;
-        }
-        flames.erase(std::remove_if(flames.begin(), flames.end(),
-                                    [](const Flame& f) { return f.life >= f.maxLife; }), flames.end());
-        if (flames.size() > 2400) flames.erase(flames.begin(), flames.begin() + (flames.size() - 2400));
-
-        for (Spark& s : sparks) {
-            s.life += dt;
-            s.vel.y -= 16.0 * dt;
-            s.vel *= 0.97;
-            s.pos += s.vel * dt;
-        }
-        sparks.erase(std::remove_if(sparks.begin(), sparks.end(),
-                                    [](const Spark& s) { return s.life >= s.maxLife; }), sparks.end());
-        for (Tracer& t : tracers) t.life += dt;
-        tracers.erase(std::remove_if(tracers.begin(), tracers.end(),
-                                     [](const Tracer& t) { return t.life > 0.05; }), tracers.end());
-        for (Muzzle& m : muzzles) m.life -= dt;
-        muzzles.erase(std::remove_if(muzzles.begin(), muzzles.end(),
-                                     [](const Muzzle& m) { return m.life <= 0.0; }), muzzles.end());
-    }
-
-    // ------------------------------------------------------------ contacts
     void onContact(const CollisionEvent& e) {
         if (!e.a || !e.b) return;
-        const real speed = e.relativeSpeed;
-        if (speed < 1.5) return;
-        RigidBody* pair[2] = {e.a, e.b};
-        for (RigidBody* b : pair) {
-            if (!b->isDynamic()) continue;
-            const Stuff s = stuff(b->id);
-            damageProp(b->id, e.normalImpulse * 0.6);
-            if (s == Stuff::Glass && speed > 3.5) {
-                queueShatter(b->id, e.point, e.normal);
-            } else if ((s == Stuff::Flesh || s == Stuff::Bone) && speed > 9.0) {
-                const real sev = std::min((real)0.9, (speed - 9.0) / 26.0);
-                if (sev > 0.12) {
-                    blood.addWound(b->id, e.point, e.normal, sev, sev > 0.55);
-                    blood.spray(e.point, e.normal, 3.0 + 9.0 * sev, 0.9, (int)(5 + 20 * sev), 0.5, 215);
-                    damageHuman(b->id, sev * 45.0);
-                }
-            } else if (s == Stuff::Metal && speed > 5.0) {
-                emitSparks(e.point, e.normal, 5, 255, 210, 130);
-            } else if ((s == Stuff::Crate || s == Stuff::Wood) && propDamage[b->id] > 90.0) {
-                queueShatter(b->id, e.point, e.normal);
+        if (e.normalImpulse < 0.4 && std::fabs(e.relativeSpeed) < 3.0) return;
+        if (hits.size() >= 3000) return;
+        HitEvent h;
+        h.a = e.a->id; h.b = e.b->id;
+        h.point = e.point; h.normal = e.normal;
+        h.impulse = e.normalImpulse;
+        h.speed = std::fabs(e.relativeSpeed);
+        hits.push_back(h);
+    }
+
+    void wall(const Vec2& p, real w, real h) { add(Kind::Ground, Shape::box(w, h), p, 0.0, BodyType::Static, 1e9); }
+
+    void spawnHuman(const Vec2& p) {
+        RagdollConfig rc;
+        rc.position = p;
+        rc.scale = 1.0;
+        rc.density = 1050.0;
+        rc.jointFriction = 0.06;
+        HumanInfo hi;
+        hi.rag = createRagdoll(world, rc);
+        int index = (int)humans.size();
+        for (size_t i = 0; i < hi.rag.parts.size(); ++i) {
+            BodyId id = hi.rag.parts[i];
+            Meta m;
+            m.kind = Kind::Human;
+            m.hp = m.maxHp = 60.0;
+            m.flammable = true;
+            m.human = index;
+            meta[id] = m;
+            RigidBody* b = world.body(id);
+            if (b) { b->material = matOf(Kind::Human); b->computeMassFromShape(); }
+        }
+        humans.push_back(hi);
+    }
+
+    void spawnChain(const Vec2& p, int links = 8) {
+        BodyId prev = add(Kind::Steel, Shape::box(0.16, 0.16), p, 0.0, BodyType::Static, 1e9);
+        Vec2 at = p;
+        for (int i = 0; i < links; ++i) {
+            at = at + Vec2(0.0, -0.34);
+            BodyId seg = add(Kind::Steel, Shape::box(0.12, 0.30), at);
+            world.createRevolute(prev, seg, Vec2(0.0, -0.16), Vec2(0.0, 0.16));
+            prev = seg;
+        }
+        add(Kind::Steel, Shape::circle(0.34), at + Vec2(0.0, -0.5));
+    }
+
+    void spawnAt(int sel, const Vec2& p) {
+        switch (sel) {
+            case SP_CRATE:   add(Kind::Wood, Shape::box(0.85, 0.85), p); break;
+            case SP_STEEL:   add(Kind::Steel, Shape::box(0.75, 0.75), p); break;
+            case SP_GLASS:   add(Kind::Glass, Shape::box(1.30, 1.70), p); break;
+            case SP_ICE:     add(Kind::Ice, Shape::box(1.10, 0.70), p); break;
+            case SP_BALL:    add(Kind::Rubber, Shape::circle(0.40), p); break;
+            case SP_STONE:   add(Kind::Stone, Shape::circle(0.62), p); break;
+            case SP_BOMB:    add(Kind::Bomb, Shape::circle(0.34), p, 0.0, BodyType::Dynamic, 12.0); break;
+            case SP_DOMINO:  add(Kind::Stone, Shape::box(0.16, 1.30), p); break;
+            case SP_BALLOON: {
+                BodyId anchor = add(Kind::Wood, Shape::box(0.4, 0.4), p);
+                BodyId ball = add(Kind::Balloon, Shape::circle(0.46), p + Vec2(0.0, 2.2));
+                world.createRope(anchor, ball, Vec2(0.0, 0.2), Vec2(0.0, -0.46), 2.2);
+                break;
             }
+            case SP_HUMAN:   spawnHuman(p); break;
+            case SP_WATER:   if (water.count() + 400 < waterCap) water.emitBlock(p, 1.4, 1.4, waterSpacing); break;
+            case SP_PLANK:   add(Kind::Wood, Shape::box(3.0, 0.18), p); break;
+            case SP_WHEEL:   add(Kind::Steel, Shape::circle(0.55), p); break;
+            case SP_CHAIN:   spawnChain(p); break;
+            default: break;
         }
     }
 
-    void onPersist(const CollisionEvent& e) {
-        if (!e.a || !e.b) return;
-        const real work = std::fabs(e.tangentImpulse) * e.relativeSpeed;
-        if (work < 12.0) return;
-        RigidBody* pair[2] = {e.a, e.b};
-        for (RigidBody* b : pair) {
-            if (!b->isDynamic()) continue;
-            registry.ref(b->id).temperature += work * 0.02;
-            const Stuff s = stuff(b->id);
-            if ((s == Stuff::Crate || s == Stuff::Wood) && work > 90.0 && !inWater(b->position, 0.4))
-                burning[b->id] = std::max(burning[b->id], (real)0.12);
-        }
-    }
+    void buildMap(int m) {
+        map = m;
+        wall(Vec2(0.0, -0.6), 40.0, 1.2);
+        wall(Vec2(-17.0, 9.0), 1.2, 22.0);
+        wall(Vec2(17.0, 9.0), 1.2, 22.0);
+        wall(Vec2(0.0, 21.0), 40.0, 1.0);
 
-    // ------------------------------------------------------------ drag
-    void beginDrag(const Vec2& at) {
-        RigidBody* b = world.queryPoint(at);
-        if (!b || b->isStatic()) return;
-        dragBody = b->id;
-        const real ca = std::cos(-b->angle), sa = std::sin(-b->angle);
-        const Vec2 d = at - b->position;
-        dragLocal = Vec2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
-        dragTarget = at;
-    }
-    void endDrag() { dragBody = INVALID_BODY; }
+        BodyId pivot = add(Kind::Steel, Shape::circle(0.22), Vec2(-11.0, 0.9), 0.0, BodyType::Static, 1e9);
+        BodyId plank = add(Kind::Wood, Shape::box(5.0, 0.22), Vec2(-11.0, 1.05));
+        world.createRevolute(pivot, plank, Vec2(), Vec2());
+        add(Kind::Steel, Shape::box(0.7, 0.7), Vec2(-9.2, 3.4));
 
-    void applyDrag() {
-        if (dragBody == INVALID_BODY) return;
-        RigidBody* b = world.body(dragBody);
-        if (!b) { dragBody = INVALID_BODY; return; }
-        const Vec2 grip = b->transform().apply(dragLocal);
-        const Vec2 delta = dragTarget - grip;
-        const Vec2 v = b->velocityAtPoint(grip);
-        b->applyForceAtPoint(delta * (900.0 * b->mass) - v * (40.0 * b->mass), grip);
-    }
+        BodyId hub = add(Kind::Steel, Shape::circle(0.3), Vec2(9.5, 7.5), 0.0, BodyType::Kinematic, 1e9);
+        RigidBody* hb = world.body(hub);
+        if (hb) hb->angularVelocity = 1.6;
+        BodyId vane = add(Kind::Wood, Shape::box(6.0, 0.24), Vec2(9.5, 7.5));
+        world.createRevolute(hub, vane, Vec2(), Vec2());
 
-    // ------------------------------------------------------------ step
-    void processPending() {
-        for (size_t i = 0; i < pendingShatter.size(); ++i) {
-            const BodyId id = pendingShatter[i];
-            if (!world.body(id)) continue;
-            const bool wasFlesh = fleshParts.count(id) != 0;
-            const int pieces = wasFlesh ? 4 : (stuff(id) == Stuff::Glass ? 9 : 6);
-            const std::vector<BodyId> frags = fracture.fracture(id, pendingShatterPt[i], pieces);
-            if (frags.empty()) continue;
-            for (BodyId f : frags) {
-                tag(f, wasFlesh ? Stuff::Flesh : Stuff::Shard);
-                if (wasFlesh) fleshParts.insert(f);
+        BodyId top = add(Kind::Steel, Shape::box(0.4, 0.4), Vec2(3.0, 13.0), 0.0, BodyType::Static, 1e9);
+        BodyId ball = add(Kind::Steel, Shape::circle(0.7), Vec2(6.5, 10.0));
+        world.createRope(top, ball, Vec2(), Vec2(), 5.2);
+
+        for (int i = 0; i < 9; ++i) add(Kind::Stone, Shape::box(0.15, 1.25), Vec2(-5.5 + i * 0.62, 0.7));
+
+        if (m == 1) {
+            for (int row = 0; row < 6; ++row)
+                for (int col = 0; col < 6 - row; ++col)
+                    add(Kind::Wood, Shape::box(0.8, 0.8), Vec2(-1.6 + col * 0.86 + row * 0.43, 0.5 + row * 0.84));
+            for (int i = 0; i < 4; ++i) add(Kind::Glass, Shape::box(1.4, 2.0), Vec2(11.0 + (i % 2) * 1.5, 1.1 + (i / 2) * 2.1));
+            for (int i = 0; i < 6; ++i) add(Kind::Steel, Shape::box(0.6, 0.6), Vec2(13.5, 0.4 + i * 0.65));
+            for (int i = 0; i < 5; ++i) add(Kind::Rubber, Shape::circle(0.35), Vec2(-14.0 + i * 0.9, 6.0));
+            add(Kind::Bomb, Shape::circle(0.34), Vec2(-13.0, 0.5), 0.0, BodyType::Dynamic, 12.0);
+            spawnChain(Vec2(-3.0, 12.0));
+            for (int i = 0; i < 3; ++i) spawnHuman(Vec2(-8.0 + i * 5.0, 3.4));
+        } else if (m == 2) {
+            wall(Vec2(-6.0, 2.0), 0.6, 4.0);
+            wall(Vec2(8.0, 2.0), 0.6, 4.0);
+            water.emitBlock(Vec2(-5.4, 0.2), 13.2, 3.1, waterSpacing);
+            for (int i = 0; i < 6; ++i) add(Kind::Wood, Shape::box(1.6, 0.35), Vec2(-4.0 + i * 2.0, 4.6));
+            for (int i = 0; i < 4; ++i) add(Kind::Ice, Shape::box(0.9, 0.6), Vec2(-2.0 + i * 1.6, 6.4));
+            for (int i = 0; i < 3; ++i) add(Kind::Steel, Shape::box(0.7, 0.7), Vec2(2.0 + i * 1.2, 9.0));
+            add(Kind::Glass, Shape::box(1.4, 2.2), Vec2(-9.0, 1.2));
+            add(Kind::Glass, Shape::box(1.4, 2.2), Vec2(12.0, 1.2));
+            spawnAt(SP_BALLOON, Vec2(10.0, 1.0));
+            for (int i = 0; i < 3; ++i) spawnHuman(Vec2(-11.0 + i * 1.6, 4.0));
+            spawnHuman(Vec2(4.0, 8.0));
+        } else {
+            for (int lvl = 0; lvl < 9; ++lvl) {
+                real y = 0.5 + lvl * 1.4;
+                add(Kind::Wood, Shape::box(0.22, 1.2), Vec2(-1.2, y));
+                add(Kind::Wood, Shape::box(0.22, 1.2), Vec2(1.2, y));
+                add(Kind::Wood, Shape::box(3.0, 0.2), Vec2(0.0, y + 0.7));
+                if (lvl % 3 == 2) add(Kind::Glass, Shape::box(2.2, 1.0), Vec2(0.0, y + 1.3));
             }
-            blood.forgetBody(id);
-            stuffOf.erase(id); fleshParts.erase(id); burning.erase(id);
-            health.erase(id); propDamage.erase(id);
-            emitSparks(pendingShatterPt[i], pendingShatterDir[i] * -1.0, 10, 220, 240, 255);
+            BodyId prev = add(Kind::Wood, Shape::box(0.5, 0.2), Vec2(-14.0, 8.0), 0.0, BodyType::Static, 1e9);
+            for (int i = 0; i < 12; ++i) {
+                BodyId seg = add(Kind::Wood, Shape::box(0.8, 0.14), Vec2(-13.2 + i * 0.9, 8.0));
+                world.createRevolute(prev, seg, Vec2(0.4, 0.0), Vec2(-0.4, 0.0));
+                prev = seg;
+            }
+            BodyId anchor = add(Kind::Wood, Shape::box(0.5, 0.2), Vec2(-2.6, 8.0), 0.0, BodyType::Static, 1e9);
+            world.createRevolute(prev, anchor, Vec2(0.4, 0.0), Vec2(-0.4, 0.0));
+            for (int i = 0; i < 4; ++i) add(Kind::Bomb, Shape::circle(0.32), Vec2(5.0 + i * 0.8, 0.5), 0.0, BodyType::Dynamic, 12.0);
+            for (int i = 0; i < 6; ++i) add(Kind::Stone, Shape::circle(0.4), Vec2(-15.5, 2.0 + i * 1.0));
+            for (int i = 0; i < 4; ++i) spawnHuman(Vec2(-11.0 + i * 3.0, 9.6));
+            spawnChain(Vec2(12.0, 14.0), 10);
         }
-        pendingShatter.clear(); pendingShatterPt.clear(); pendingShatterDir.clear();
     }
 
-    // A single NaN would take the whole simulation (and the SPH wave array)
-    // down with it, so both worlds are sanitised every step.
-    void sanitizeBodies() {
-        std::vector<BodyId> bad;
-        for (RigidBody* b : world.bodies()) {
-            if (!std::isfinite(b->position.x) || !std::isfinite(b->position.y) ||
-                !std::isfinite(b->velocity.x) || !std::isfinite(b->velocity.y) ||
-                !std::isfinite(b->angle) || !std::isfinite(b->angularVelocity)) {
-                if (b->isDynamic()) bad.push_back(b->id);
+    void killBody(BodyId id) {
+        for (size_t i = 0; i < doomed.size(); ++i) if (doomed[i] == id) return;
+        doomed.push_back(id);
+    }
+
+    void ignite(BodyId id, real amount) {
+        Meta* m = metaOf(id);
+        if (!m || !m->flammable) return;
+        m->burn = std::min((real)1.0, m->burn + amount);
+        m->temp += amount * 220.0;
+    }
+
+    void damage(BodyId id, real amount, const Vec2& point, const Vec2& dir, bool bullet) {
+        Meta* m = metaOf(id);
+        if (!m || m->kind == Kind::Ground) return;
+        RigidBody* b = world.body(id);
+        Vec2 nd = dir.lengthSq() > 1e-12 ? dir.normalized() : Vec2(0.0, 1.0);
+        if (m->human >= 0 && m->human < (int)humans.size()) {
+            HumanInfo& hi = humans[(size_t)m->human];
+            hi.hp -= amount;
+            real sev = clampr2(amount / 26.0, 0.12, 1.0);
+            blood.addWound(id, point, nd, sev, bullet && sev > 0.45);
+            blood.spray(point, nd * -1.0, 5.0 + 14.0 * sev, 0.55, (int)(4 + 12 * sev), 0.4 + 1.6 * sev, 228);
+            blood.stainBody(id, 0.3 + 2.2 * sev);
+            if (hi.hp <= 0.0 && !hi.dead) {
+                hi.dead = true;
+                ++kills;
+                blood.sever(id, point, nd, 1.0);
+                blood.splash(point, 9.0, 40, 2.4, 210);
+                for (size_t k = 0; k < hi.rag.parts.size(); ++k) blood.stainBody(hi.rag.parts[k], 1.4);
+            }
+            return;
+        }
+        m->hp -= amount;
+        if (m->breakable && amount > 11.0 && b) {
+            std::vector<BodyId> pieces = frac.fracture(id, point, m->kind == Kind::Glass ? 6 : 5);
+            if (!pieces.empty()) return;
+        }
+        if (m->kind == Kind::Bomb && m->hp <= 0.0) {
+            Boom bo; bo.c = b ? b->position : point; bo.power = 26.0; bo.radius = 5.5;
+            if (pendingBooms.size() < 64) pendingBooms.push_back(bo);
+            killBody(id);
+            return;
+        }
+        if (m->hp <= 0.0) killBody(id);
+    }
+
+    void explode(const Vec2& c, real power, real radius) {
+        std::vector<BodyId> touched;
+        std::vector<RigidBody*>& list = world.bodies();
+        for (size_t i = 0; i < list.size(); ++i) {
+            RigidBody* b = asBody(list[i]);
+            if (!b || !b->isDynamic()) continue;
+            Vec2 d = b->position - c;
+            real r = d.length();
+            if (r > radius || r < 1e-6) continue;
+            real falloff = 1.0 - r / radius;
+            b->applyImpulseAtPoint(d.normalized() * (power * falloff * b->mass * 0.55), b->position);
+            b->wake();
+            touched.push_back(b->id);
+        }
+        for (size_t i = 0; i < touched.size(); ++i) {
+            RigidBody* b = world.body(touched[i]);
+            if (!b) continue;
+            Vec2 d = b->position - c;
+            real falloff = clampr2(1.0 - d.length() / radius, 0.0, 1.0);
+            ignite(touched[i], falloff * 0.8);
+            damage(touched[i], power * falloff * 1.4, b->position, d, false);
+        }
+        for (int i = 0; i < 60; ++i) {
+            Ember e;
+            e.p = c + Vec2(rnd(-0.3, 0.3), rnd(-0.3, 0.3));
+            real a = rnd(0.0, 6.2831853), sp = rnd(3.0, 16.0);
+            e.v = Vec2(std::cos(a) * sp, std::sin(a) * sp + 3.0);
+            e.max = e.life = rnd(0.5, 1.5);
+            e.heat = rnd(1000.0, 1800.0);
+            embers.push_back(e);
+        }
+        for (int i = 0; i < 40; ++i) {
+            Spark s;
+            s.p = c;
+            real a = rnd(0.0, 6.2831853), sp = rnd(6.0, 26.0);
+            s.v = Vec2(std::cos(a) * sp, std::sin(a) * sp);
+            s.max = s.life = rnd(0.2, 0.6);
+            sparks.push_back(s);
+        }
+        if (water.count() > 0 && water.count() + 60 < waterCap)
+            for (int i = 0; i < 30; ++i)
+                water.emit(c + Vec2(rnd(-0.4, 0.4), rnd(0.0, 0.5)), Vec2(rnd(-6.0, 6.0), rnd(2.0, 10.0)));
+    }
+
+    void fire(const Vec2& origin, const Vec2& aim) {
+        const WeaponSpec& ws = WEAPONS[weapon];
+        if (ws.pellets <= 0 || cooldown > 0.0) return;
+        cooldown = ws.cooldown;
+        ++shots;
+        Vec2 dir = aim.lengthSq() > 1e-9 ? aim.normalized() : Vec2(1.0, 0.0);
+        if (ws.lobbed) {
+            BodyId id = add(Kind::Bomb, Shape::circle(0.26), origin + dir * 0.6, 0.0, BodyType::Dynamic, 10.0);
+            RigidBody* b = world.body(id);
+            if (b) b->velocity = dir * ws.speed;
+            Bomb g;
+            g.id = id;
+            g.fuse = 1.5;
+            bombs.push_back(g);
+            return;
+        }
+        for (int p = 0; p < ws.pellets; ++p) {
+            Vec2 d = dir.rotated(rnd(-ws.spread, ws.spread));
+            if (ws.ignite) {
+                Ember e;
+                e.p = origin + d * 0.5;
+                e.v = d * (ws.speed + rnd(-2.0, 2.0));
+                e.max = e.life = rnd(0.6, 1.3);
+                e.heat = rnd(900.0, 1500.0);
+                embers.push_back(e);
                 continue;
             }
-            if (!b->isDynamic()) continue;
-            // Bullets are ray casts, so nothing needs to travel at 250 m/s.
-            const real v = b->velocity.length();
-            if (v > 45.0) b->velocity *= 45.0 / v;
-            if (b->angularVelocity >  90.0) b->angularVelocity =  90.0;
-            if (b->angularVelocity < -90.0) b->angularVelocity = -90.0;
-            if (b->position.y < arenaFloor - 30.0 || std::fabs(b->position.x) > 60.0)
-                bad.push_back(b->id);
-        }
-        for (BodyId id : bad) removeBody(id);
-    }
-
-    // SPH can build up runaway pressure; anything moving like a bullet is
-    // cooled back down so the pool stays a pool.
-    void sanitizeFluid() {
-        const real maxSpeed = 6.0;
-        bool bad = false;
-        for (const FluidParticle& q : fluid.particles()) {
-            if (!q.active) continue;
-            if (!std::isfinite(q.position.x) || !std::isfinite(q.position.y) ||
-                !std::isfinite(q.velocity.x) || !std::isfinite(q.velocity.y) ||
-                q.velocity.lengthSq() > maxSpeed * maxSpeed) { bad = true; break; }
-        }
-        if (!bad) return;
-        std::vector<std::pair<Vec2, Vec2>> keep;
-        keep.reserve(fluid.count());
-        for (const FluidParticle& q : fluid.particles()) {
-            if (!q.active) continue;
-            if (!std::isfinite(q.position.x) || !std::isfinite(q.position.y)) continue;
-            Vec2 v = q.velocity;
-            if (!std::isfinite(v.x) || !std::isfinite(v.y)) v = Vec2();
-            const real sp = v.length();
-            if (sp > maxSpeed) v *= maxSpeed / sp;
-            keep.push_back(std::make_pair(q.position, v));
-        }
-        fluid.clear();
-        for (size_t i = 0; i < keep.size(); ++i) fluid.emit(keep[i].first, keep[i].second);
-    }
-
-    void update(real dt) {
-        if (paused && !stepOnce) { updateFx(dt); return; }
-        stepOnce = false;
-        const real scale = slowMotion ? 0.22 : (turbo ? 2.2 : 1.0);
-        const real h = std::min((real)0.05, dt * scale);
-
-        fireCooldown -= h;
-        field.windBase = Vec2(windStrength, 0.0);
-        if (windStrength > 0.01 || windStrength < -0.01) field.update(h);
-
-        applyDrag();
-        sanitizeBodies();
-        sanitizeFluid();
-        fluid.update(h);
-        rebuildWaterGrid();
-
-        if (!elec.electrodes().empty()) { elec.update(h); shockBodies(h); }
-
-        world.step(h);
-        thermal.update(h);
-        blood.update(h);
-        updateFire(h);
-        updateFx(h);
-        processPending();
-        simTime += h;
-    }
-
-    void shockBodies(real dt) {
-        for (const ShockEvent& s : elec.shocks()) {
-            RigidBody* b = world.body(s.body);
-            if (!b || !b->isDynamic() || !fleshParts.count(s.body)) continue;
-            // Electrocution: the muscles convulse, the skin burns.
-            b->applyImpulseAtPoint(Vec2(rng.range(-1.0, 1.0), rng.range(-0.4, 1.2)) *
-                                       (0.35 * std::fabs(s.current) * b->mass), b->position);
-            registry.ref(s.body).temperature += std::fabs(s.power) * dt * 0.4;
-            damageHuman(s.body, std::fabs(s.power) * dt * 2.5);
-            if (rng.unit() < 0.05) {
-                blood.addWound(s.body, b->position, Vec2(0.0, 1.0), 0.12, false);
-                emitSparks(b->position, Vec2(0.0, 1.0), 3, 180, 220, 255);
-            }
-        }
-    }
-
-    std::string hud() const {
-        char buf[512];
-        std::snprintf(buf, sizeof(buf),
-                      "%s | map %d | bodies %zu | water %zu | blood %zu/%zu | fire %zu | "
-                      "wind %.0f m/s | humans %d | shots %d | kills %d%s",
-                      toolName(tool), (int)map + 1, world.bodyCount(), fluid.count(),
-                      blood.stats().droplets, blood.stats().decals, burning.size(),
-                      windStrength, ragdollCount, shotsFired, kills,
-                      paused ? " | PAUSED" : (slowMotion ? " | SLOW-MO" : (turbo ? " | TURBO" : "")));
-        return std::string(buf);
-    }
-};
-
-// ============================================================ RENDERER
-#if defined(_WIN32) && !defined(GORELAB_HEADLESS)
-#include <windows.h>
-
-static int  g_width = 1440, g_height = 860;
-static real g_ppm = 34.0;                    // pixels per metre
-static Vec2 g_cam(0.0, 7.0);
-
-struct BackBuffer {
-    HBITMAP bmp = nullptr;
-    HDC dc = nullptr;
-    uint32_t* px = nullptr;
-    int w = 0, h = 0;
-
-    void resize(HDC ref, int nw, int nh) {
-        if (bmp && nw == w && nh == h) return;
-        if (bmp) { DeleteObject(bmp); bmp = nullptr; }
-        if (dc) { DeleteDC(dc); dc = nullptr; }
-        w = nw; h = nh;
-        BITMAPINFO bi;
-        ZeroMemory(&bi, sizeof(bi));
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;             // top-down
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        void* bits = nullptr;
-        bmp = CreateDIBSection(ref, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        px = (uint32_t*)bits;
-        dc = CreateCompatibleDC(ref);
-        SelectObject(dc, bmp);
-    }
-
-    inline void blend(int x, int y, int r, int g, int b, real a) {
-        if (x < 0 || y < 0 || x >= w || y >= h || a <= 0.0 || !px) return;
-        if (a > 1.0) a = 1.0;
-        uint32_t& d = px[y * w + x];
-        const int dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
-        const int nr = (int)(dr + (r - dr) * a);
-        const int ng = (int)(dg + (g - dg) * a);
-        const int nb = (int)(db + (b - db) * a);
-        d = (uint32_t)((nr << 16) | (ng << 8) | nb);
-    }
-    void disc(int cx, int cy, real rad, int r, int g, int b, real a) {
-        const int ri = (int)std::ceil(rad);
-        for (int y = -ri; y <= ri; ++y)
-            for (int x = -ri; x <= ri; ++x) {
-                const real d = std::sqrt((real)(x * x + y * y));
-                if (d > rad) continue;
-                blend(cx + x, cy + y, r, g, b, a * (1.0 - 0.55 * d / std::max((real)1.0, rad)));
-            }
-    }
-    void line(Vec2 a, Vec2 b, int r, int g, int bb, real alpha, real thick = 1.0);
-};
-static BackBuffer g_bb;
-
-static inline POINT toScreen(const Vec2& w) {
-    POINT p;
-    p.x = (LONG)((w.x - g_cam.x) * g_ppm + g_width * 0.5);
-    p.y = (LONG)(g_height * 0.5 - (w.y - g_cam.y) * g_ppm);
-    return p;
-}
-static inline Vec2 toWorld(int sx, int sy) {
-    return Vec2((sx - g_width * 0.5) / g_ppm + g_cam.x,
-                (g_height * 0.5 - sy) / g_ppm + g_cam.y);
-}
-void BackBuffer::line(Vec2 a, Vec2 b, int r, int g, int bb2, real alpha, real thick) {
-    const POINT pa = toScreen(a), pb = toScreen(b);
-    const int steps = (int)std::max((real)1.0,
-                        (real)std::max(std::abs(pb.x - pa.x), std::abs(pb.y - pa.y)));
-    const int ti = (int)thick;
-    for (int i = 0; i <= steps; ++i) {
-        const real t = (real)i / steps;
-        const int x = (int)(pa.x + (pb.x - pa.x) * t);
-        const int y = (int)(pa.y + (pb.y - pa.y) * t);
-        for (int oy = -ti; oy <= ti; ++oy)
-            for (int ox = -ti; ox <= ti; ++ox) blend(x + ox, y + oy, r, g, bb2, alpha);
-    }
-}
-
-// ---- basic procedural textures -------------------------------------------
-static void boundsOf(const POINT* p, int n, int& minx, int& maxx, int& miny, int& maxy) {
-    minx = maxx = (int)p[0].x; miny = maxy = (int)p[0].y;
-    for (int i = 1; i < n; ++i) {
-        minx = std::min(minx, (int)p[i].x); maxx = std::max(maxx, (int)p[i].x);
-        miny = std::min(miny, (int)p[i].y); maxy = std::max(maxy, (int)p[i].y);
-    }
-}
-static void textureWood(const POINT* pts, int n, real angle, real charAmount) {
-    int minx, maxx, miny, maxy;
-    boundsOf(pts, n, minx, maxx, miny, maxy);
-    const real c = std::cos(angle), s = std::sin(angle);
-    const int step = std::max(5, (maxy - miny) / 4);
-    const real k = std::max((real)0.0, (real)1.0 - charAmount);
-    for (int y = std::max(0, miny); y <= maxy; ++y)
-        for (int x = std::max(0, minx); x <= maxx; ++x) {
-            const int lx = (int)((x - minx) * c + (y - miny) * s);
-            if (step <= 0 || (lx % step) != 0) continue;
-            g_bb.blend(x, y, (int)(72 * k), (int)(48 * k), (int)(26 * k), 0.35);
-        }
-}
-static void textureMetal(const POINT* pts, int n) {
-    int minx, maxx, miny, maxy;
-    boundsOf(pts, n, minx, maxx, miny, maxy);
-    for (int y = miny + 3; y <= maxy - 3; y += 9)
-        for (int x = minx + 3; x <= maxx - 3; x += 9) g_bb.disc(x, y, 1.6, 210, 214, 224, 0.5);
-    for (int y = miny; y <= maxy; ++y) g_bb.blend(minx + (maxx - minx) / 4, y, 235, 240, 250, 0.25);
-}
-static void textureGlass(const POINT* pts, int n) {
-    int minx, maxx, miny, maxy;
-    boundsOf(pts, n, minx, maxx, miny, maxy);
-    const int span = std::max(1, maxx - minx);
-    for (int y = miny; y <= maxy; ++y) {
-        const int x = minx + (int)((y - miny) * 0.35) % span;
-        g_bb.blend(x, y, 255, 255, 255, 0.20);
-        g_bb.blend(x + 1, y, 255, 255, 255, 0.12);
-    }
-}
-static void bloodColor(uint8_t oxygen, real wetness, int& r, int& g, int& b) {
-    uint8_t rr = 0, gg = 0, bb = 0;
-    BloodSystem::colorOf(oxygen, wetness, rr, gg, bb);
-    r = (int)rr; g = (int)gg; b = (int)bb;
-}
-
-static void stuffColor(Stuff s, real charAmount, real wet, int& r, int& g, int& b) {
-    switch (s) {
-        case Stuff::Ground: r = 62;  g = 58;  b = 52;  break;
-        case Stuff::Wall:   r = 74;  g = 70;  b = 64;  break;
-        case Stuff::Crate:  r = 158; g = 108; b = 56;  break;
-        case Stuff::Wood:   r = 132; g = 92;  b = 48;  break;
-        case Stuff::Metal:  r = 168; g = 174; b = 186; break;
-        case Stuff::Glass:  r = 150; g = 198; b = 214; break;
-        case Stuff::Shard:  r = 176; g = 214; b = 226; break;
-        case Stuff::Flesh:  r = 214; g = 156; b = 142; break;
-        case Stuff::Bone:   r = 226; g = 214; b = 196; break;
-        default:            r = 130; g = 130; b = 130; break;
-    }
-    const real c = std::min((real)0.85, charAmount);
-    r = (int)(r * (1.0 - c)); g = (int)(g * (1.0 - c)); b = (int)(b * (1.0 - c));
-    if (wet > 0.0) {                                   // blood soaked
-        const real w = std::min((real)0.8, wet);
-        r = (int)(r + (120 - r) * w);
-        g = (int)(g * (1.0 - w * 0.8));
-        b = (int)(b * (1.0 - w * 0.8));
-    }
-}
-
-static void renderScene(GoreLab& game) {
-    for (int y = 0; y < g_bb.h; ++y) {                 // backdrop gradient
-        const real t = (real)y / std::max(1, g_bb.h);
-        const uint32_t c = ((uint32_t)(26 + 22 * t) << 16) | ((uint32_t)(28 + 24 * t) << 8) |
-                           (uint32_t)(34 + 30 * t);
-        for (int x = 0; x < g_bb.w; ++x) g_bb.px[y * g_bb.w + x] = c;
-    }
-
-    if (game.showWater) {                              // water, tinted by voltage
-        const std::vector<real>& volts = game.elec.nodeVoltages();
-        size_t idx = 0;
-        for (const FluidParticle& p : game.fluid.particles()) {
-            if (!p.active) continue;
-            const POINT sp = toScreen(p.position);
-            const real v = (idx < volts.size()) ? volts[idx] : 0.0;
-            ++idx;
-            const real e = std::min((real)1.0, std::fabs(v) / 220.0);
-            g_bb.disc(sp.x, sp.y, g_ppm * 0.22, (int)(50 + 190 * e), (int)(120 + 110 * e),
-                      (int)(210 + 40 * e), 0.5 + 0.4 * e);
-        }
-    }
-
-    for (const BloodPool& pool : game.blood.pools()) { // pools on the floor
-        const POINT sp = toScreen(pool.center);
-        int r, g, b;
-        bloodColor(pool.oxygen, pool.wetness, r, g, b);
-        const int hw = (int)(pool.halfWidth * g_ppm);
-        const int hh = std::max(2, (int)(pool.depth * g_ppm));
-        for (int y = -hh; y <= hh; ++y)
-            for (int x = -hw; x <= hw; ++x)
-                g_bb.blend(sp.x + x, sp.y + y, r, g, b,
-                           0.75 * (1.0 - (real)std::abs(x) / std::max(1, hw)));
-    }
-
-    for (RigidBody* body : game.world.bodies()) {      // bodies
-        const Stuff s = game.stuff(body->id);
-        real charAmount = 0.0;
-        auto bit = game.burning.find(body->id);
-        if (bit != game.burning.end()) charAmount = 0.5 * bit->second;
-        auto dit = game.propDamage.find(body->id);
-        if (dit != game.propDamage.end()) charAmount += std::min((real)0.4, dit->second / 200.0);
-        int r, g, b;
-        stuffColor(s, charAmount, game.blood.wetnessOf(body->id), r, g, b);
-
-        if (body->shape.type == ShapeType::Circle) {
-            const POINT c = toScreen(body->position);
-            g_bb.disc(c.x, c.y, body->shape.radius * g_ppm, r, g, b, 0.95);
-        } else if (body->shape.type == ShapeType::Capsule) {
-            Vec2 a, e;
-            body->shape.capsuleSegment(body->transform(), a, e);
-            const POINT pa = toScreen(a), pb = toScreen(e);
-            const int steps = std::max(1, (int)std::max(std::abs(pb.x - pa.x), std::abs(pb.y - pa.y)));
-            for (int i = 0; i <= steps; ++i) {
-                const real t = (real)i / steps;
-                g_bb.disc((int)(pa.x + (pb.x - pa.x) * t), (int)(pa.y + (pb.y - pa.y) * t),
-                          body->shape.radius * g_ppm, r, g, b, 0.95);
-            }
-        } else {
-            const std::vector<Vec2>& vs = body->worldVertices;
-            if (vs.size() < 3) continue;
-            std::vector<POINT> pts(vs.size());
-            for (size_t i = 0; i < vs.size(); ++i) pts[i] = toScreen(vs[i]);
-            int minx, maxx, miny, maxy;
-            boundsOf(pts.data(), (int)pts.size(), minx, maxx, miny, maxy);
-            for (int y = std::max(0, miny); y <= std::min(g_bb.h - 1, maxy); ++y) {
-                std::vector<int> xs;
-                for (size_t i = 0; i < pts.size(); ++i) {
-                    const POINT& p1 = pts[i];
-                    const POINT& p2 = pts[(i + 1) % pts.size()];
-                    if ((p1.y <= y && p2.y > y) || (p2.y <= y && p1.y > y))
-                        xs.push_back((int)(p1.x + (real)(y - p1.y) / (p2.y - p1.y) * (p2.x - p1.x)));
+            Vec2 to = origin + d * 70.0;
+            RayHit hit;
+            Tracer t;
+            t.a = origin;
+            t.b = to;
+            t.life = 0.05;
+            if (rayCastClosest(world, origin, to, hit) && hit.body) {
+                t.b = hit.point;
+                RigidBody* b = hit.body;
+                BodyId victim = b->id;
+                Vec2 hp = hit.point;
+                b->applyImpulseAtPoint(d * (ws.impulse * 60.0), hp);
+                b->wake();
+                for (int i = 0; i < 6; ++i) {
+                    Spark s;
+                    s.p = hp;
+                    s.v = hit.normal * rnd(1.0, 6.0) + Vec2(rnd(-3.0, 3.0), rnd(-1.0, 4.0));
+                    s.max = s.life = rnd(0.1, 0.35);
+                    sparks.push_back(s);
                 }
-                std::sort(xs.begin(), xs.end());
-                for (size_t i = 0; i + 1 < xs.size(); i += 2)
-                    for (int x = xs[i]; x <= xs[i + 1]; ++x) g_bb.blend(x, y, r, g, b, 0.95);
+                damage(victim, ws.damage, hp, d, true);
             }
-            if (s == Stuff::Crate || s == Stuff::Wood || s == Stuff::Ground)
-                textureWood(pts.data(), (int)pts.size(), body->angle, charAmount);
-            else if (s == Stuff::Metal) textureMetal(pts.data(), (int)pts.size());
-            else if (s == Stuff::Glass || s == Stuff::Shard) textureGlass(pts.data(), (int)pts.size());
-            for (size_t i = 0; i < pts.size(); ++i)
-                g_bb.line(vs[i], vs[(i + 1) % vs.size()], 12, 12, 16, 0.6);
+            tracers.push_back(t);
         }
     }
 
-    for (const BloodDecal& d : game.blood.decals()) {  // blood stuck to bodies
-        RigidBody* host = game.world.body(d.body);
-        if (!host) continue;
-        const POINT sp = toScreen(host->transform().apply(d.anchor));
-        int r, g, b;
-        bloodColor(d.oxygen, d.wetness, r, g, b);
-        g_bb.disc(sp.x, sp.y, std::max((real)1.5, d.volume * 0.6), r, g, b, 0.85);
+    Vec2 windAt(const Vec2& p) const {
+        real g = std::sin(windTime * 0.7 + p.x * 0.12) * gustAmp * 0.35 + std::sin(windTime * 1.9) * gustAmp * 0.2;
+        return Vec2(wind + g, std::sin(windTime * 1.3 + p.y * 0.2) * gustAmp * 0.12);
     }
-    for (const BloodDroplet& dr : game.blood.droplets()) {
-        if (!dr.active) continue;
-        const POINT sp = toScreen(dr.position);
-        int r, g, b;
-        bloodColor(dr.oxygen, 1.0, r, g, b);
-        g_bb.disc(sp.x, sp.y, std::max((real)1.0, dr.radius * g_ppm), r, g, b, 0.9);
+
+    // stability guard: no NaN, no runaway velocities, no escapers
+    void sanitize() {
+        std::vector<RigidBody*>& list = world.bodies();
+        for (size_t i = 0; i < list.size(); ++i) {
+            RigidBody* b = asBody(list[i]);
+            if (!b || !b->isDynamic()) continue;
+            bool bad = !std::isfinite(b->position.x) || !std::isfinite(b->position.y) ||
+                       !std::isfinite(b->angle) || !std::isfinite(b->velocity.x) ||
+                       !std::isfinite(b->velocity.y) || !std::isfinite(b->angularVelocity);
+            if (bad) {
+                b->position = Vec2(rnd(-10.0, 10.0), 16.0);
+                b->prevPosition = b->position;
+                b->angle = 0.0;
+                b->prevAngle = 0.0;
+                b->velocity = Vec2();
+                b->angularVelocity = 0.0;
+                b->acceleration = Vec2();
+                continue;
+            }
+            if (b->position.x < -60.0 || b->position.x > 60.0 || b->position.y < -40.0 || b->position.y > 90.0) {
+                b->position = Vec2(clampr2(b->position.x, -14.0, 14.0), 16.0);
+                b->prevPosition = b->position;
+                b->velocity = b->velocity * 0.1;
+                b->angularVelocity = 0.0;
+            }
+            real sp = b->velocity.length();
+            if (sp > 150.0) b->velocity = b->velocity * (150.0 / sp);
+            b->angularVelocity = clampr2(b->angularVelocity, -70.0, 70.0);
+            if (b->angle > 1e5 || b->angle < -1e5) b->angle = 0.0;
+        }
     }
-    for (const Tracer& t : game.tracers) g_bb.line(t.a, t.b, 255, 238, 170, 0.85, 1.0);
-    for (const Muzzle& m : game.muzzles) {
-        const POINT sp = toScreen(m.pos + m.dir * 0.25);
-        g_bb.disc(sp.x, sp.y, 9.0, 255, 220, 150, 0.9);
+
+    void step(real dt) {
+        if (paused || dt <= 0.0) return;
+        simTime += dt;
+        windTime += dt;
+        cooldown = std::max((real)0.0, cooldown - dt);
+        world.setGravity(Vec2(0.0, -9.81 * gravityMul));
+
+        std::vector<RigidBody*>& list = world.bodies();
+        for (size_t i = 0; i < list.size(); ++i) {
+            RigidBody* b = asBody(list[i]);
+            if (!b || !b->isDynamic() || b->sleeping) continue;
+            Vec2 rel = windAt(b->position) - b->velocity;
+            real sp = rel.length();
+            if (sp < 0.05) continue;
+            real area = 2.0 * b->boundingRadius;
+            b->applyForce(rel.normalized() * (0.5 * 1.204 * 1.15 * area * sp * sp));
+        }
+
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        world.step(dt);
+        ccd.update(dt);
+        frac.update(dt);
+        if (water.count() > 0) { real h = dt / 3.0; for (int i = 0; i < 3; ++i) water.update(h); }
+        // ---- вода тушит огонь -------------------------------------------
+        if (water.count() > 0) {
+            for (std::unordered_map<BodyId, Meta>::iterator wit = meta.begin(); wit != meta.end(); ++wit) {
+                if (wit->second.burn <= 0.0) continue;
+                RigidBody* wb = world.body(wit->first);
+                if (!wb) continue;
+                const real wet = water.wetnessAt(wb->position, wb->boundingRadius + 0.35);
+                if (wet <= 0.02) continue;
+                wit->second.burn = std::max((real)0.0, wit->second.burn - dt * (3.0 + 9.0 * wet));
+                wit->second.temp = std::max((real)293.0, wit->second.temp - dt * 400.0 * wet);
+                if (sparks.size() < 900) {
+                    Spark st;
+                    st.p = wb->position + Vec2(rnd(-0.3, 0.3), rnd(-0.2, 0.4));
+                    st.v = Vec2(rnd(-0.6, 0.6), rnd(0.9, 2.4));
+                    st.life = 0.0;
+                    st.max = 0.75;
+                    st.r = 232; st.g = 236; st.b = 240;
+                    sparks.push_back(st);
+                }
+            }
+            for (size_t ei = 0; ei < embers.size();) {
+                if (water.wetnessAt(embers[ei].p, 0.30) > 0.02) {
+                    embers[ei] = embers.back();
+                    embers.pop_back();
+                } else {
+                    ++ei;
+                }
+            }
+        }
+        blood.update(dt);
+        sanitize();
+        stepMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        std::vector<HitEvent> local;
+        local.swap(hits);
+        for (size_t i = 0; i < local.size(); ++i) {
+            const HitEvent& hv = local[i];
+            Meta* ma = metaOf(hv.a);
+            Meta* mb = metaOf(hv.b);
+            if (!ma || !mb) continue;
+            real load = hv.impulse * 0.06 + hv.speed * 0.35;
+            if (load < 1.2) continue;
+            bool aSharp = ma->sharp, bSharp = mb->sharp;
+            int aHuman = ma->human, bHuman = mb->human;
+            Kind aKind = ma->kind, bKind = mb->kind;
+            for (int side = 0; side < 2; ++side) {
+                BodyId id = side ? hv.b : hv.a;
+                int self = side ? bHuman : aHuman;
+                bool otherSharp = side ? aSharp : bSharp;
+                Kind kind = side ? bKind : aKind;
+                if (kind == Kind::Ground) continue;
+                if (!world.body(id)) continue;
+                if (self >= 0) {
+                    if (otherSharp && hv.speed > 3.2) { ++cuts; damage(id, std::min((real)16.0, load * 1.4), hv.point, hv.normal, false); }
+                    else if (load > 6.0) damage(id, load * 0.55, hv.point, hv.normal, false);
+                    continue;
+                }
+                if (load > 4.0) damage(id, load * 0.4, hv.point, hv.normal, false);
+            }
+        }
+
+        for (int guard = 0; guard < 24 && !pendingBooms.empty(); ++guard) {
+            std::vector<Boom> q;
+            q.swap(pendingBooms);
+            for (size_t i = 0; i < q.size(); ++i) explode(q[i].c, q[i].power, q[i].radius);
+        }
+        pendingBooms.clear();
+
+        for (size_t i = 0; i < bombs.size();) {
+            bombs[i].fuse -= dt;
+            if (bombs[i].fuse <= 0.0) {
+                RigidBody* b = world.body(bombs[i].id);
+                Vec2 c = b ? b->position : Vec2();
+                if (b) killBody(bombs[i].id);
+                bombs[i] = bombs.back();
+                bombs.pop_back();
+                explode(c, 30.0, 6.0);
+            } else ++i;
+        }
+
+        for (size_t i = 0; i < embers.size();) {
+            Ember& e = embers[i];
+            e.life -= dt;
+            if (e.life <= 0.0) { e = embers.back(); embers.pop_back(); continue; }
+            Vec2 w = windAt(e.p);
+            e.v = e.v + (w - e.v) * std::min((real)1.0, dt * 2.2) + Vec2(0.0, 5.4 * dt);
+            e.p = e.p + e.v * dt;
+            e.heat *= std::max((real)0.0, 1.0 - dt * 0.8);
+            RigidBody* hitBody = world.queryPoint(e.p);
+            if (hitBody) { ignite(hitBody->id, dt * 1.4); e.v = e.v * 0.35; }
+            ++i;
+        }
+
+        std::vector<BodyId> burning;
+        for (std::unordered_map<BodyId, Meta>::iterator it = meta.begin(); it != meta.end(); ++it)
+            if (it->second.burn > 0.0) burning.push_back(it->first);
+        for (size_t i = 0; i < burning.size(); ++i) {
+            Meta* m = metaOf(burning[i]);
+            RigidBody* b = world.body(burning[i]);
+            if (!m || !b) continue;
+            m->burn = std::max((real)0.0, m->burn - dt * 0.05);
+            m->temp = 293.0 + m->burn * 700.0;
+            if (m->human >= 0 && m->human < (int)humans.size()) humans[(size_t)m->human].hp -= dt * 6.0 * m->burn;
+            m->hp -= dt * 9.0 * m->burn;
+            if (rnd01() < m->burn * dt * 26.0) {
+                Ember e;
+                e.p = b->position + Vec2(rnd(-0.3, 0.3), rnd(-0.3, 0.3));
+                e.v = Vec2(rnd(-1.0, 1.0), rnd(1.0, 3.5));
+                e.max = e.life = rnd(0.4, 1.0);
+                e.heat = 900.0 + m->burn * 700.0;
+                embers.push_back(e);
+            }
+            if (m->hp <= 0.0 && m->human < 0) {
+                Kind k = m->kind;
+                Vec2 pos = b->position;
+                killBody(burning[i]);
+                if (k == Kind::Bomb) explode(pos, 30.0, 6.0);
+            }
+        }
+
+        for (size_t i = 0; i < sparks.size();) {
+            Spark& s = sparks[i];
+            s.life -= dt;
+            if (s.life <= 0.0) { s = sparks.back(); sparks.pop_back(); continue; }
+            s.v = s.v + Vec2(0.0, -16.0 * dt);
+            s.p = s.p + s.v * dt;
+            ++i;
+        }
+        for (size_t i = 0; i < tracers.size();) {
+            tracers[i].life -= dt;
+            if (tracers[i].life <= 0.0) { tracers[i] = tracers.back(); tracers.pop_back(); }
+            else ++i;
+        }
+
+        std::vector<BodyId> gone;
+        gone.swap(doomed);
+        for (size_t i = 0; i < gone.size(); ++i) {
+            BodyId id = gone[i];
+            Meta* m = metaOf(id);
+            if (m && m->human >= 0) continue;
+            if (world.body(id)) world.destroyBody(id);
+            forget(id);
+        }
     }
-    for (const Spark& sp : game.sparks) {
-        const POINT p = toScreen(sp.pos);
-        g_bb.disc(p.x, p.y, 1.8, sp.r, sp.g, sp.b, 1.0 - sp.life / sp.maxLife);
+
+    void drawBody(Canvas& cv, const Camera& cam, RigidBody* b) {
+        Meta* m = metaOf(b->id);
+        Kind k = m ? m->kind : Kind::Ground;
+        real burn = m ? m->burn : 0.0;
+        int r, g, bl;
+        colorOfKind(k, burn, r, g, bl);
+        real wet = blood.wetnessOf(b->id);
+        if (wet > 0.01) {
+            real t = clampr2(wet, 0.0, 1.0) * 0.75;
+            r = (int)(r * (1.0 - t) + 120 * t);
+            g = (int)(g * (1.0 - t) + 12 * t);
+            bl = (int)(bl * (1.0 - t) + 16 * t);
+        }
+        real alpha = (k == Kind::Glass) ? 0.55 : (k == Kind::Ice ? 0.75 : 1.0);
+        const std::vector<Vec2>& wv = b->worldVertices;
+        if (!wv.empty()) {
+            std::vector<Vec2> pts;
+            pts.reserve(wv.size());
+            for (size_t i = 0; i < wv.size(); ++i) pts.push_back(cam.toScreen(wv[i]));
+            cv.poly(pts, r, g, bl, alpha);
+            cv.outline(pts, 1.6, (int)(r * 0.45), (int)(g * 0.45), (int)(bl * 0.45), 0.9);
+            if (pts.size() >= 2)
+                cv.line(pts[0].x, pts[0].y, pts[1].x, pts[1].y, 1.4,
+                        std::min(255, r + 60), std::min(255, g + 60), std::min(255, bl + 60), 0.5);
+        } else if (b->shape.halfLength > 0.0) {
+            Vec2 a, c;
+            b->shape.capsuleSegment(b->transform(), a, c);
+            Vec2 sa = cam.toScreen(a), sc = cam.toScreen(c);
+            cv.line(sa.x, sa.y, sc.x, sc.y, b->shape.radius * 2.0 * cam.ppm, r, g, bl, alpha);
+        } else {
+            Vec2 s = cam.toScreen(b->position);
+            real rad = b->shape.radius * cam.ppm;
+            cv.disc(s.x, s.y, rad, r, g, bl, alpha);
+            cv.disc(s.x - rad * 0.28, s.y - rad * 0.3, rad * 0.4,
+                    std::min(255, r + 70), std::min(255, g + 70), std::min(255, bl + 70), 0.45);
+            Vec2 mark = cam.toScreen(b->position + Vec2(std::cos(b->angle), std::sin(b->angle)) * b->shape.radius * 0.85);
+            cv.line(s.x, s.y, mark.x, mark.y, 1.6, (int)(r * 0.4), (int)(g * 0.4), (int)(bl * 0.4), 0.8);
+        }
+        if (burn > 0.05) {
+            Vec2 s = cam.toScreen(b->position);
+            cv.softDisc(s.x, s.y, b->boundingRadius * cam.ppm * 1.5, 255, 150, 40, 0.35 * burn, true);
+        }
     }
-    for (const Flame& f : game.flames) {
-        const POINT p = toScreen(f.pos);
-        const real t = f.life / f.maxLife, a = (1.0 - t) * 0.85;
-        if (f.smoke) g_bb.disc(p.x, p.y, f.size * g_ppm * (1.0 + t * 2.0), 180, 180, 185, a * 0.5);
-        else g_bb.disc(p.x, p.y, f.size * g_ppm * (1.0 + t), 255, (int)(200 - 140 * t),
-                       (int)(70 - 60 * t), a);
+
+    void drawWater(Canvas& cv, const Camera& cam) {
+        const std::vector<FluidParticle>& ps = water.particles();
+        real rad = waterSpacing * cam.ppm * 1.5;
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (!ps[i].active) continue;
+            Vec2 s = cam.toScreen(ps[i].position);
+            if (s.x < -8 || s.y < -8 || s.x > cv.w + 8 || s.y > cv.h + 8) continue;
+            real dens = clampr2(ps[i].density / std::max((real)1.0, water.restDensity), 0.0, 1.6);
+            real sp = ps[i].velocity.length();
+            int r = (int)(30 + 40 * (1.0 - dens));
+            int g = (int)(110 + 60 * (1.0 - dens) + std::min((real)70.0, sp * 6.0));
+            int b = (int)(200 + 40 * dens);
+            cv.softDisc(s.x, s.y, rad, r, std::min(255, g), std::min(255, b), 0.55);
+            if (sp > 4.5) cv.softDisc(s.x, s.y, rad * 0.7, 235, 245, 255, 0.35, true);
+        }
     }
-    for (const Electrode& e : game.elec.electrodes()) {
-        const POINT p = toScreen(e.position);
-        g_bb.disc(p.x, p.y, 6.0, e.ground ? 120 : 255, e.ground ? 200 : 240, 255, 0.9);
+
+    void drawBlood(Canvas& cv, const Camera& cam) {
+        if (!showBlood) return;
+        const std::vector<BloodPool>& pools = blood.pools();
+        for (size_t i = 0; i < pools.size(); ++i) {
+            uint8_t r, g, b;
+            BloodSystem::colorOf(pools[i].oxygen, pools[i].wetness, r, g, b);
+            Vec2 s = cam.toScreen(pools[i].center);
+            real hw = pools[i].halfWidth * cam.ppm;
+            for (int k = 0; k < 3; ++k)
+                cv.softDisc(s.x, s.y + k * 1.0, hw * (1.0 - k * 0.18), (int)r, (int)g, (int)b, 0.55);
+        }
+        const std::vector<BloodDecal>& decals = blood.decals();
+        std::vector<Vec2> pts;
+        for (size_t i = 0; i < decals.size(); ++i) {
+            const BloodDecal& d = decals[i];
+            uint8_t r, g, b;
+            BloodSystem::colorOf(d.oxygen, d.wetness, r, g, b);
+            Vec2 base = d.anchor;
+            real ang = 0.0;
+            if (d.body != INVALID_BODY) {
+                RigidBody* bb = world.body(d.body);
+                if (!bb) continue;
+                ang = bb->angle;
+                base = bb->position + d.anchor.rotated(ang);
+            }
+            if (d.outline.size() >= 3) {
+                pts.clear();
+                for (size_t k = 0; k < d.outline.size(); ++k) pts.push_back(cam.toScreen(base + d.outline[k].rotated(ang)));
+                cv.poly(pts, (int)r, (int)g, (int)b, 0.85);
+            } else {
+                Vec2 s = cam.toScreen(base);
+                cv.softDisc(s.x, s.y, 0.09 * cam.ppm, (int)r, (int)g, (int)b, 0.8);
+            }
+        }
+        const std::vector<BloodDroplet>& drops = blood.droplets();
+        for (size_t i = 0; i < drops.size(); ++i) {
+            if (!drops[i].active) continue;
+            uint8_t r, g, b;
+            BloodSystem::colorOf(drops[i].oxygen, 1.0, r, g, b);
+            Vec2 s = cam.toScreen(drops[i].position);
+            Vec2 pv = cam.toScreen(drops[i].previous);
+            real rad = std::max((real)0.9, drops[i].radius * cam.ppm);
+            if (drops[i].kind == BloodKind::Mist) cv.softDisc(s.x, s.y, rad * 2.2, (int)r, (int)g, (int)b, 0.30);
+            else {
+                cv.line(pv.x, pv.y, s.x, s.y, rad * 1.2, (int)r, (int)g, (int)b, 0.8);
+                cv.disc(s.x, s.y, rad, (int)r, (int)g, (int)b, 0.95);
+            }
+        }
     }
-    if (game.dragBody != INVALID_BODY)
-        if (RigidBody* b = game.world.body(game.dragBody))
-            g_bb.line(b->transform().apply(game.dragLocal), game.dragTarget, 240, 240, 120, 0.7);
+
+    void drawEffects(Canvas& cv, const Camera& cam) {
+        for (size_t i = 0; i < embers.size(); ++i) {
+            const Ember& e = embers[i];
+            real t = clampr2(e.life / std::max((real)0.001, e.max), 0.0, 1.0);
+            Vec2 s = cam.toScreen(e.p);
+            real heat = clampr2(e.heat / 1800.0, 0.0, 1.0);
+            cv.softDisc(s.x, s.y, (0.22 + 0.5 * (1.0 - t)) * cam.ppm,
+                        (int)(180 + 75 * heat), (int)(70 + 110 * heat), (int)(20 + 40 * heat), 0.55 * t, true);
+        }
+        for (size_t i = 0; i < sparks.size(); ++i) {
+            const Spark& s = sparks[i];
+            real t = clampr2(s.life / std::max((real)0.001, s.max), 0.0, 1.0);
+            Vec2 a = cam.toScreen(s.p), b = cam.toScreen(s.p - s.v * 0.02);
+            cv.line(a.x, a.y, b.x, b.y, 1.6, s.r, s.g, s.b, t);
+        }
+        for (size_t i = 0; i < tracers.size(); ++i) {
+            Vec2 a = cam.toScreen(tracers[i].a), b = cam.toScreen(tracers[i].b);
+            cv.line(a.x, a.y, b.x, b.y, 1.4, 255, 235, 170, 0.7);
+        }
+    }
+
+    void drawHud(Canvas& cv, const Camera& cam, const Input& in) {
+        (void)cam;
+        const int pw = 168;
+        cv.rect(0, 0, pw, cv.h - 1, 16, 18, 24, 0.82);
+        cv.text("SPAWNER", 12, 10, 2, 235, 235, 245);
+        for (int i = 0; i < SP_COUNT; ++i) {
+            int y = 34 + i * 22;
+            bool sel = (i == spawnSel);
+            if (sel) cv.rect(6, y - 4, pw - 6, y + 14, 60, 96, 150, 0.9);
+            cv.text(SPAWN_NAMES[i], 14, y, 2, sel ? 255 : 190, sel ? 255 : 195, sel ? 255 : 205);
+        }
+        int wy = 34 + SP_COUNT * 22 + 14;
+        cv.text("WEAPON", 12, wy, 2, 235, 225, 190);
+        for (int i = 0; i < WEAPON_COUNT; ++i) {
+            int y = wy + 22 + i * 20;
+            bool sel = (i == weapon);
+            if (sel) cv.rect(6, y - 4, pw - 6, y + 12, 150, 70, 60, 0.9);
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "%d %s", i + 1, WEAPONS[i].name);
+            cv.text(buf, 14, y, 2, sel ? 255 : 185, sel ? 235 : 185, sel ? 220 : 195);
+        }
+        int sy = wy + 26 + WEAPON_COUNT * 20;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "WIND %+.1f", (double)wind);
+        cv.text(buf, 12, sy, 2, 170, 210, 235);
+        std::snprintf(buf, sizeof(buf), "GUST %.1f", (double)gustAmp);
+        cv.text(buf, 12, sy + 20, 2, 170, 210, 235);
+        std::snprintf(buf, sizeof(buf), "GRAV %.2f", (double)gravityMul);
+        cv.text(buf, 12, sy + 40, 2, 170, 210, 235);
+        std::snprintf(buf, sizeof(buf), "TIME %.2f", (double)timeScale);
+        cv.text(buf, 12, sy + 60, 2, 170, 210, 235);
+        cv.text("Q E WIND   Z X GUST", 12, sy + 86, 1, 140, 150, 165);
+        cv.text("G GRAV  T SLOWMO  SPACE PAUSE", 12, sy + 98, 1, 140, 150, 165);
+        cv.text("LMB FIRE  RMB SPAWN  MMB DRAG", 12, sy + 110, 1, 140, 150, 165);
+        cv.text("V DEBUG  B BLOOD  F5 RESET  ESC MENU", 12, sy + 122, 1, 140, 150, 165);
+
+        cv.rect(pw + 1, 0, cv.w - 1, 40, 14, 16, 22, 0.78);
+        BloodStats bs = blood.stats();
+        std::snprintf(buf, sizeof(buf),
+            "MAP %d  FPS %.0f  STEP %.2f MS  BODIES %zu  AWAKE %zu  CONTACTS %zu  JOINTS %zu",
+            map, (double)fps, (double)stepMs, world.bodyCount(), world.awakeCount(),
+            world.contactCount(), world.constraintCount());
+        cv.text(buf, pw + 12, 8, 2, 225, 230, 240);
+        std::snprintf(buf, sizeof(buf),
+            "WATER %zu DROPS %zu DECALS %zu POOLS %zu WOUNDS %zu FIRE %zu BREAKS %d CUTS %d SHOTS %d KILLS %d",
+            water.count(), bs.droplets, bs.decals, bs.pools, bs.wounds, embers.size(),
+            fractures, cuts, shots, kills);
+        cv.text(buf, pw + 12, 24, 2, 200, 215, 235);
+
+        cv.line(in.mx - 9, in.my, in.mx + 9, in.my, 1.4, 250, 240, 180, 0.8);
+        cv.line(in.mx, in.my - 9, in.mx, in.my + 9, 1.4, 250, 240, 180, 0.8);
+        if (paused) cv.text("PAUSED", cv.w / 2 - 40, 60, 3, 255, 220, 120);
+    }
+
+    void draw(Canvas& cv, const Camera& cam, const Input& in) {
+        cv.clearGradient(18, 20, 30, 44, 48, 62);
+        drawBlood(cv, cam);
+        std::vector<RigidBody*>& list = world.bodies();
+        for (size_t i = 0; i < list.size(); ++i) {
+            RigidBody* b = asBody(list[i]);
+            if (b) drawBody(cv, cam, b);
+        }
+        drawWater(cv, cam);
+        drawEffects(cv, cam);
+        if (showDebug) {
+            for (size_t i = 0; i < list.size(); ++i) {
+                RigidBody* b = asBody(list[i]);
+                if (!b) continue;
+                Vec2 a = cam.toScreen(Vec2(b->aabb.min.x, b->aabb.max.y));
+                Vec2 c = cam.toScreen(Vec2(b->aabb.max.x, b->aabb.min.y));
+                cv.rect((int)a.x, (int)a.y, (int)c.x, (int)a.y + 1, 90, 200, 120, 0.5);
+                cv.rect((int)a.x, (int)c.y, (int)c.x, (int)c.y + 1, 90, 200, 120, 0.5);
+                cv.rect((int)a.x, (int)a.y, (int)a.x + 1, (int)c.y, 90, 200, 120, 0.5);
+                cv.rect((int)c.x, (int)a.y, (int)c.x + 1, (int)c.y, 90, 200, 120, 0.5);
+                Vec2 s = cam.toScreen(b->position);
+                Vec2 v = cam.toScreen(b->position + b->velocity * 0.15);
+                cv.line(s.x, s.y, v.x, v.y, 1.2, 240, 120, 90, 0.7);
+            }
+        }
+        drawHud(cv, cam, in);
+    }
+};
+
+struct Menu {
+    int sel = 6;
+    int map = 1;
+    int humansExtra = 0;
+    bool water = true;
+    int quality = 1;
+    real wind = 0.0;
+    real gravity = 1.0;
+    bool start = false;
+
+    static const int ROWS = 7;
+    const char* rowName(int i) const {
+        switch (i) {
+            case 0: return "MAP";
+            case 1: return "EXTRA HUMANS";
+            case 2: return "WATER";
+            case 3: return "QUALITY";
+            case 4: return "WIND";
+            case 5: return "GRAVITY";
+            default: return "START GAME";
+        }
+    }
+    void rowValue(int i, char* out, size_t n) const {
+        switch (i) {
+            case 0: std::snprintf(out, n, "%s", map == 1 ? "1 STEEL BOX" : (map == 2 ? "2 WATER POOL" : "3 TOWER")); break;
+            case 1: std::snprintf(out, n, "%d", humansExtra); break;
+            case 2: std::snprintf(out, n, "%s", water ? "ON" : "OFF"); break;
+            case 3: std::snprintf(out, n, "%s", quality == 0 ? "LOW" : (quality == 1 ? "NORMAL" : "HEAVY")); break;
+            case 4: std::snprintf(out, n, "%+.1f M/S", (double)wind); break;
+            case 5: std::snprintf(out, n, "%.2f G", (double)gravity); break;
+            default: std::snprintf(out, n, "%s", "ENTER"); break;
+        }
+    }
+    void move(int dir) { sel = (sel + dir + ROWS) % ROWS; }
+    void adjust(int dir) {
+        switch (sel) {
+            case 0: map = 1 + ((map - 1 + dir + 3) % 3); break;
+            case 1: humansExtra = (int)clampr2(humansExtra + dir, 0.0, 12.0); break;
+            case 2: water = !water; break;
+            case 3: quality = (int)clampr2(quality + dir, 0.0, 2.0); break;
+            case 4: wind = clampr2(wind + dir * 1.0, -25.0, 25.0); break;
+            case 5: gravity = clampr2(gravity + dir * 0.1, -1.0, 3.0); break;
+            default: start = true; break;
+        }
+    }
+    void draw(Canvas& cv, real t) const {
+        cv.clearGradient(10, 11, 18, 30, 16, 20);
+        for (int i = 0; i < 90; ++i) {
+            real x = std::fmod(i * 137.0 + t * 20.0, (real)cv.w);
+            real y = std::fmod(i * 71.0 + t * 8.0, (real)cv.h);
+            cv.softDisc(x, y, 26.0, 120, 20, 24, 0.06, true);
+        }
+        const char* title = "GORELAB REMAKE";
+        cv.text(title, cv.w / 2 - cv.textW(title, 7) / 2, 70, 7, 232, 60, 52);
+        const char* sub = "PHYS2D SANDBOX - BODIES JOINTS CCD FRACTURE SPH WATER RAGDOLLS BLOOD FIRE WIND";
+        cv.text(sub, cv.w / 2 - cv.textW(sub, 1) / 2, 132, 1, 170, 176, 190);
+        char val[64];
+        for (int i = 0; i < ROWS; ++i) {
+            int y = 190 + i * 44;
+            bool s = (i == sel);
+            if (s) cv.rect(cv.w / 2 - 320, y - 10, cv.w / 2 + 320, y + 26, 60, 30, 34, 0.85);
+            cv.text(rowName(i), cv.w / 2 - 300, y, 3, s ? 255 : 190, s ? 210 : 190, s ? 190 : 200);
+            rowValue(i, val, sizeof(val));
+            cv.text(val, cv.w / 2 + 60, y, 3, s ? 255 : 175, s ? 240 : 180, s ? 200 : 190);
+        }
+        const char* help = "ARROWS SELECT AND CHANGE   ENTER START   ESC QUIT";
+        cv.text(help, cv.w / 2 - cv.textW(help, 2) / 2, 190 + ROWS * 44 + 30, 2, 150, 158, 172);
+    }
+};
+
+static void applyMenu(Game& g, const Menu& mn) {
+    g.wind = mn.wind;
+    g.gravityMul = mn.gravity;
+    g.waterCap = mn.quality == 0 ? 2500u : (mn.quality == 1 ? 6000u : 12000u);
+    g.blood.maxDroplets = mn.quality == 0 ? 4000u : (mn.quality == 1 ? 9000u : 20000u);
+    g.frac.maxFragmentsPerStep = mn.quality == 0 ? 12 : (mn.quality == 1 ? 24 : 60);
+    g.world.config().solver.velocityIterations = mn.quality == 2 ? 18 : 14;
+    g.buildMap(mn.map);
+    if (!mn.water) g.water.clear();
+    for (int i = 0; i < mn.humansExtra; ++i) g.spawnHuman(Vec2(rnd(-12.0, 12.0), rnd(6.0, 14.0)));
 }
 
-static GoreLab* g_game = nullptr;
-static bool g_lmb = false, g_lmbEdge = false;
+static void handleGameKeys(Game& g, Input& in, Camera& cam, real dt, bool& backToMenu, bool& reset) {
+    for (int i = 0; i < WEAPON_COUNT && i < 9; ++i) if (in.pressed['1' + i]) g.weapon = i;
+    if (in.pressed['Q']) g.wind = clampr2(g.wind - 1.0, -25.0, 25.0);
+    if (in.pressed['E']) g.wind = clampr2(g.wind + 1.0, -25.0, 25.0);
+    if (in.pressed['Z']) g.gustAmp = clampr2(g.gustAmp - 0.5, 0.0, 20.0);
+    if (in.pressed['X']) g.gustAmp = clampr2(g.gustAmp + 0.5, 0.0, 20.0);
+    if (in.pressed['G']) g.gravityMul = (g.gravityMul > 0.5 ? 0.0 : 1.0);
+    if (in.pressed['T']) g.timeScale = (g.timeScale > 0.9 ? 0.25 : (g.timeScale > 0.2 ? 2.0 : 1.0));
+    if (in.pressed['B']) g.showBlood = !g.showBlood;
+    if (in.pressed['V']) g.showDebug = !g.showDebug;
+    if (in.pressed[' ']) g.paused = !g.paused;
+    if (in.pressed[0x74]) reset = true;
+    if (in.pressed[0x1B]) backToMenu = true;
+    real pan = 14.0 * dt;
+    if (in.key['A']) cam.center.x -= pan;
+    if (in.key['D']) cam.center.x += pan;
+    if (in.key['W']) cam.center.y += pan;
+    if (in.key['S']) cam.center.y -= pan;
+    if (in.wheel != 0) cam.ppm = clampr2(cam.ppm * (in.wheel > 0 ? 1.12 : 0.89), 8.0, 160.0);
+}
 
-static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+static void headlessRun(int mapId, int steps, bool useWater) {
+    Game g;
+    g.init();
+    Menu mn;
+    mn.map = mapId;
+    mn.water = useWater;
+    mn.humansExtra = 2;
+    mn.wind = 6.0;
+    applyMenu(g, mn);
+
+    Camera cam;
+    Canvas cv;
+    cv.resize(cam.w, cam.h);
+    Input in;
+    const real dt = 1.0 / 60.0;
+    std::printf("\n=== MAP %d ===\nbodies %zu  water %zu  humans %zu\n",
+                mapId, g.world.bodyCount(), g.water.count(), g.humans.size());
+    for (int i = 0; i < steps; ++i) {
+        if (i % 24 == 0) {
+            g.weapon = (i / 24) % (WEAPON_COUNT - 2);
+            g.cooldown = 0.0;
+            Vec2 origin(-15.0, 6.0 + std::sin(i * 0.1) * 3.0);
+            Vec2 target(rnd(-6.0, 14.0), rnd(0.6, 10.0));
+            g.fire(origin, target - origin);
+        }
+        if (i % 40 == 20) g.spawnAt((i / 40) % SP_COUNT, Vec2(rnd(-12.0, 12.0), 15.0));
+        if (i == 150) g.explode(Vec2(0.0, 2.0), 34.0, 7.0);
+        if (i == 300) g.explode(Vec2(-8.0, 1.5), 26.0, 6.0);
+        g.step(dt);
+        if ((i + 1) % 100 == 0) {
+            BloodStats bs = g.blood.stats();
+            std::printf("step %4d  bodies %4zu  awake %4zu  contacts %4zu  joints %3zu  water %5zu  drops %5zu"
+                        "  decals %5zu  pools %4zu  fire %4zu  breaks %3d  cuts %3d  kills %2d  step %5.2f ms\n",
+                        i + 1, g.world.bodyCount(), g.world.awakeCount(), g.world.contactCount(),
+                        g.world.constraintCount(), g.water.count(), bs.droplets, bs.decals, bs.pools,
+                        g.embers.size(), g.fractures, g.cuts, g.kills, (double)g.stepMs);
+        }
+    }
+    int bad = 0;
+    std::vector<RigidBody*>& list = g.world.bodies();
+    for (size_t i = 0; i < list.size(); ++i) {
+        RigidBody* b = asBody(list[i]);
+        if (!b) continue;
+        if (!std::isfinite(b->position.x) || !std::isfinite(b->position.y) || !std::isfinite(b->angle)) ++bad;
+    }
+    g.draw(cv, cam, in);
+    char path[64];
+    std::snprintf(path, sizeof(path), "gorelab_map%d.ppm", mapId);
+    cv.savePpm(path);
+    std::printf("map %d done: non finite bodies %d, screenshot %s (%dx%d)\n", mapId, bad, path, cv.w, cv.h);
+}
+
+#if defined(GORELAB_WIN)
+static Input g_in;
+static bool g_running = true;
+
+static LRESULT CALLBACK wndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_DESTROY: PostQuitMessage(0); return 0;
-        case WM_SIZE: g_width = LOWORD(lp); g_height = HIWORD(lp); return 0;
-        case WM_MOUSEMOVE: {
-            if (g_game) {
-                g_game->aimPoint = toWorld((int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
-                g_game->dragTarget = g_game->aimPoint;
-            }
-            return 0;
-        }
-        case WM_LBUTTONDOWN: g_lmb = true; g_lmbEdge = true; return 0;
-        case WM_LBUTTONUP:   g_lmb = false; return 0;
-        case WM_RBUTTONDOWN: if (g_game) g_game->beginDrag(g_game->aimPoint); return 0;
-        case WM_RBUTTONUP:   if (g_game) g_game->endDrag(); return 0;
-        case WM_MOUSEWHEEL:
-            g_ppm = std::max((real)8.0, std::min((real)120.0,
-                    g_ppm * (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1.1 : 0.9)));
-            return 0;
-        case WM_KEYDOWN: {
-            if (!g_game) return 0;
-            GoreLab& g = *g_game;
-            switch (wp) {
-                case '1': g.tool = Tool::Human;   break;
-                case '2': g.tool = Tool::Water;   break;
-                case '3': g.tool = Tool::Crate;   break;
-                case '4': g.tool = Tool::Glass;   break;
-                case '5': g.tool = Tool::Metal;   break;
-                case '6': g.tool = Tool::Pistol;  break;
-                case '7': g.tool = Tool::Shotgun; break;
-                case '8': g.tool = Tool::Rifle;   break;
-                case '9': g.tool = Tool::Fire;    break;
-                case '0': g.tool = Tool::Grenade; break;
-                case 'E': g.tool = Tool::Voltage; break;
-                case 'X': g.tool = Tool::Erase;   break;
-                case VK_F1: g.loadMap(MapId::Box); break;
-                case VK_F2: g.loadMap(MapId::WaterBox); break;
-                case 'P': g.paused = !g.paused; break;
-                case VK_OEM_PERIOD: g.stepOnce = true; break;
-                case 'L': g.slowMotion = !g.slowMotion; g.turbo = false; break;
-                case 'T': g.turbo = !g.turbo; g.slowMotion = false; break;
-                case VK_OEM_4: g.windStrength = std::max((real)-30.0, g.windStrength - 2.0); break;
-                case VK_OEM_6: g.windStrength = std::min((real)30.0, g.windStrength + 2.0); break;
-                case 'R': g.loadMap(g.map); break;
-                case VK_ESCAPE: PostQuitMessage(0); break;
-            }
-            return 0;
-        }
+        case WM_CLOSE: case WM_DESTROY: g_running = false; return 0;
+        case WM_KEYDOWN: if (wp < 256 && !g_in.key[wp]) { g_in.key[wp] = true; g_in.pressed[wp] = true; } return 0;
+        case WM_KEYUP:   if (wp < 256) g_in.key[wp] = false; return 0;
+        case WM_MOUSEMOVE: g_in.mx = (int)(short)LOWORD(lp); g_in.my = (int)(short)HIWORD(lp); return 0;
+        case WM_LBUTTONDOWN: g_in.lmb = true; g_in.lclick = true; return 0;
+        case WM_LBUTTONUP:   g_in.lmb = false; return 0;
+        case WM_RBUTTONDOWN: g_in.rmb = true; g_in.rclick = true; return 0;
+        case WM_RBUTTONUP:   g_in.rmb = false; return 0;
+        case WM_MBUTTONDOWN: g_in.key[0x04] = true; return 0;
+        case WM_MBUTTONUP:   g_in.key[0x04] = false; return 0;
+        case WM_MOUSEWHEEL:  g_in.wheel += (int)((short)HIWORD(wp)) / 120; return 0;
+        default: break;
     }
-    return DefWindowProc(hwnd, msg, wp, lp);
+    return DefWindowProc(hw, msg, wp, lp);
 }
 
-int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
-    WNDCLASS wc;
-    ZeroMemory(&wc, sizeof(wc));
+static int runWindowed() {
+    const int W = 1440, H = 860;
+    WNDCLASSA wc;
+    std::memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = wndProc;
-    wc.hInstance = inst;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "gorelabRemakeWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_CROSS);
-    wc.lpszClassName = "GoreLabRemake";
-    RegisterClass(&wc);
-    HWND hwnd = CreateWindow("GoreLabRemake", "GoreLab Remake - phys2d sandbox",
-                             WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-                             g_width, g_height, nullptr, nullptr, inst, nullptr);
-    GoreLab game;
-    g_game = &game;
+    RegisterClassA(&wc);
+    RECT r = { 0, 0, W, H };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hw = CreateWindowA(wc.lpszClassName, "GoreLab Remake - phys2d sandbox",
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                            r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hw) return 1;
+    HDC hdc = GetDC(hw);
 
-    LARGE_INTEGER freq, prev;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&prev);
+    Canvas cv;
+    cv.resize(W, H);
+    Camera cam;
+    cam.w = W; cam.h = H;
+    Menu mn;
+    std::unique_ptr<Game> game;
+    bool inMenu = true;
+    real menuTime = 0.0;
 
-    MSG msg;
-    bool running = true;
-    while (running) {
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { running = false; break; }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        if (!running) break;
+    BITMAPINFO bi;
+    std::memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
 
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        real dt = (real)(now.QuadPart - prev.QuadPart) / (real)freq.QuadPart;
+    std::chrono::steady_clock::time_point prev = std::chrono::steady_clock::now();
+    while (g_running) {
+        g_in.newFrame();
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        real dt = clampr2(std::chrono::duration<double>(now - prev).count(), 1.0 / 600.0, 1.0 / 20.0);
         prev = now;
-        dt = std::max((real)(1.0 / 600.0), std::min((real)(1.0 / 20.0), dt));
 
-        if (g_lmb) {
-            const bool autoFire = (game.tool == Tool::Rifle || game.tool == Tool::Water ||
-                                   game.tool == Tool::Fire);
-            if (autoFire || g_lmbEdge) {
-                const Vec2 muzzle(g_cam.x - 14.0, 3.0);   // guns fire from the left
-                game.useTool(game.aimPoint, muzzle);
+        if (inMenu) {
+            menuTime += dt;
+            if (g_in.pressed[VK_UP]) mn.move(-1);
+            if (g_in.pressed[VK_DOWN]) mn.move(1);
+            if (g_in.pressed[VK_LEFT]) mn.adjust(-1);
+            if (g_in.pressed[VK_RIGHT]) mn.adjust(1);
+            if (g_in.pressed[VK_RETURN]) mn.start = true;
+            if (g_in.pressed[VK_ESCAPE]) g_running = false;
+            if (mn.start) {
+                mn.start = false;
+                game.reset(new Game());
+                game->init();
+                applyMenu(*game, mn);
+                cam.center = Vec2(0.0, 8.0);
+                inMenu = false;
             }
-            g_lmbEdge = false;
+            mn.draw(cv, menuTime);
+        } else {
+            Game& g = *game;
+            bool back = false, reset = false;
+            handleGameKeys(g, g_in, cam, dt, back, reset);
+            Vec2 mouseWorld = cam.toWorld((real)g_in.mx, (real)g_in.my);
+            bool overPanel = (g_in.mx < 170);
+            if (g_in.lclick && overPanel) {
+                int idx = (g_in.my - 30) / 22;
+                if (idx >= 0 && idx < SP_COUNT) g.spawnSel = idx;
+                int wy = 34 + SP_COUNT * 22 + 14;
+                int widx = (g_in.my - (wy + 18)) / 20;
+                if (widx >= 0 && widx < WEAPON_COUNT) g.weapon = widx;
+            } else if (g_in.lmb && !overPanel) {
+                Vec2 muzzle = cam.center + Vec2(0.0, -1.0);
+                g.fire(muzzle, mouseWorld - muzzle);
+            }
+            if (g_in.rclick && !overPanel) g.spawnAt(g.spawnSel, mouseWorld);
+            if (g_in.key[0x04] && !overPanel) {
+                if (g.held == INVALID_BODY) {
+                    RigidBody* pick = g.world.queryPoint(mouseWorld);
+                    if (pick && pick->isDynamic()) g.held = pick->id;
+                }
+                RigidBody* hb = g.world.body(g.held);
+                if (hb) { hb->velocity = (mouseWorld - hb->position) * 12.0; hb->wake(); }
+            } else g.held = INVALID_BODY;
+            if (reset) { game.reset(new Game()); game->init(); applyMenu(*game, mn); }
+            else {
+                g.step(dt * g.timeScale);
+                g.fps = 1.0 / std::max((real)1e-4, dt);
+                g.draw(cv, cam, g_in);
+            }
+            if (back) inMenu = true;
         }
-
-        game.update(dt);
-
-        HDC hdc = GetDC(hwnd);
-        g_bb.resize(hdc, g_width, g_height);
-        renderScene(game);
-        SetBkMode(g_bb.dc, TRANSPARENT);
-        SetTextColor(g_bb.dc, RGB(235, 235, 235));
-        const std::string hud = game.hud();
-        TextOutA(g_bb.dc, 12, 10, hud.c_str(), (int)hud.size());
-        const char* l1 = "1 human  2 water  3 crate  4 glass  5 steel  6 pistol  7 shotgun  8 rifle  9 fire  0 grenade";
-        const char* l2 = "E electrode  X erase  RMB drag  wheel zoom  F1/F2 map  P pause  . step  L slow-mo  T turbo  [ ] wind  R reset";
-        TextOutA(g_bb.dc, 12, 28, l1, (int)std::strlen(l1));
-        TextOutA(g_bb.dc, 12, 46, l2, (int)std::strlen(l2));
-        BitBlt(hdc, 0, 0, g_width, g_height, g_bb.dc, 0, 0, SRCCOPY);
-        ReleaseDC(hwnd, hdc);
+        StretchDIBits(hdc, 0, 0, W, H, 0, 0, W, H, cv.px.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
     }
-    return 0;
-}
-
-#else
-// ============================================================ headless test
-int main() {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("GoreLab Remake - headless verification\n");
-    std::printf("======================================\n\n");
-
-    GoreLab game;
-    std::printf("[map 1] plain box\n");
-    std::printf("  bodies after load      : %zu\n", game.world.bodyCount());
-    game.spawnRagdoll(Vec2(-2.0, 6.0));
-    game.spawnRagdoll(Vec2(2.0, 6.0));
-    for (int i = 0; i < 120; ++i) game.update(1.0 / 60.0);
-    std::printf("  humans                 : %d (bodies %zu)\n", game.ragdollCount, game.world.bodyCount());
-
-    const Vec2 muzzle(-14.0, 3.0);
-    game.fireCooldown = 0.0;
-    game.shoot(muzzle, Vec2(0.0, 3.2), WEAPON_PISTOL);
-    for (int i = 0; i < 30; ++i) game.update(1.0 / 60.0);
-    std::printf("  pistol                 : airborne blood %zu, wounds %zu\n",
-                game.blood.stats().droplets, game.blood.stats().wounds);
-
-    game.fireCooldown = 0.0;
-    game.shoot(muzzle, Vec2(-2.0, 3.0), WEAPON_SHOTGUN);
-    for (int i = 0; i < 40; ++i) game.update(1.0 / 60.0);
-    std::printf("  shotgun (9 pellets)    : blood %zu drops / %zu decals / %zu pools\n",
-                game.blood.stats().droplets, game.blood.stats().decals, game.blood.stats().pools);
-
-    for (int shot = 0; shot < 90; ++shot) {
-        game.fireCooldown = 0.0;
-        game.shoot(muzzle, Vec2(2.0, 3.0 + 0.02 * shot), WEAPON_RIFLE);
-        game.update(1.0 / 60.0);
-    }
-    std::printf("  rifle burst            : %d shots, kills %d\n", game.shotsFired, game.kills);
-
-    const BodyId pane = game.makeGlassPane(Vec2(10.0, 2.0), 0.16, 3.0);
-    size_t before = game.world.bodyCount();
-    game.queueShatter(pane, Vec2(10.0, 2.4), Vec2(1.0, 0.0));
-    game.update(1.0 / 60.0);
-    std::printf("  glass shattered        : bodies %zu -> %zu (shards)\n", before, game.world.bodyCount());
-
-    game.igniteAt(Vec2(6.5, 3.8), 1.0);
-    for (int i = 0; i < 180; ++i) game.update(1.0 / 60.0);
-    std::printf("  fire                   : burning %zu, flame particles %zu\n",
-                game.burning.size(), game.flames.size());
-
-    before = game.world.bodyCount();
-    game.throwGrenade(Vec2(0.0, 2.0));
-    for (int i = 0; i < 5; ++i) game.update(1.0 / 60.0);
-    std::printf("  grenade                : bodies %zu -> %zu, airborne blood %zu\n",
-                before, game.world.bodyCount(), game.blood.stats().droplets);
-    for (int i = 0; i < 55; ++i) game.update(1.0 / 60.0);
-
-    game.windStrength = 24.0;
-    for (int i = 0; i < 120; ++i) game.update(1.0 / 60.0);
-    std::printf("  wind 24 m/s            : stable, bodies %zu\n\n", game.world.bodyCount());
-
-    game.loadMap(MapId::WaterBox);
-    for (int i = 0; i < 120; ++i) game.update(1.0 / 60.0);
-    {
-        Vec2 lo(1e30, 1e30), hi(-1e30, -1e30);
-        for (const FluidParticle& q : game.fluid.particles()) {
-            if (!q.active) continue;
-            lo.x = std::min(lo.x, q.position.x); lo.y = std::min(lo.y, q.position.y);
-            hi.x = std::max(hi.x, q.position.x); hi.y = std::max(hi.y, q.position.y);
-        }
-        std::printf("[map 2] water box\n");
-        std::printf("  water particles        : %zu, pool x[%.1f..%.1f] y[%.1f..%.1f]\n",
-                    game.fluid.count(), lo.x, hi.x, lo.y, hi.y);
-    }
-
-    game.spawnRagdoll(Vec2(-6.0, 6.0));
-    for (int i = 0; i < 150; ++i) game.update(1.0 / 60.0);
-    std::printf("  human dropped in water : bodies %zu\n", game.world.bodyCount());
-
-    game.placeElectrode(Vec2(-8.0, 0.8));
-    for (int i = 0; i < 60; ++i) game.update(1.0 / 60.0);
-    std::printf("  220 V in the water     : nodes %zu, current %.4f A, power %.1f W, shocked %zu\n",
-                game.elec.wetNodeCount(), game.elec.totalCurrent(),
-                game.elec.dissipatedPower(), game.elec.shocks().size());
-
-    const BodyId dry = game.makeCrate(Vec2(0.0, 12.0), 0.9);
-    game.update(1.0 / 60.0);
-    bool dryShocked = false;
-    for (const ShockEvent& s : game.elec.shocks()) if (s.body == dry) dryShocked = true;
-    std::printf("  dry body above the pool: %s\n", dryShocked ? "SHOCKED (bug)" : "safe (correct)");
-
-    const size_t burnBefore = game.burning.size();
-    game.makeCrate(Vec2(-2.0, 6.0), 0.9);
-    game.igniteAt(Vec2(-2.0, 6.0), 1.0);
-    const size_t lit = game.burning.size();
-    for (int i = 0; i < 240; ++i) game.update(1.0 / 60.0);
-    std::printf("  burning crate in water : %zu -> %zu lit -> %zu after it fell in\n",
-                burnBefore, lit, game.burning.size());
-
-    std::printf("\nfinal: %s\n", game.hud().c_str());
-    std::printf("\nall gameplay systems executed.\n");
+    ReleaseDC(hw, hdc);
     return 0;
 }
 #endif
+
+int main(int argc, char** argv) {
+    bool headless = false;
+    int steps = 600;
+    int only = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--headless")) headless = true;
+        else if (!std::strcmp(argv[i], "--steps") && i + 1 < argc) steps = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--map") && i + 1 < argc) only = std::atoi(argv[++i]);
+    }
+#if defined(GORELAB_WIN)
+    if (!headless) return runWindowed();
+#endif
+    (void)headless;
+    std::printf("GoreLab Remake 2 - headless engine stress test (%d steps per map)\n", steps);
+    if (only >= 1 && only <= 3) headlessRun(only, steps, true);
+    else { headlessRun(1, steps, false); headlessRun(2, steps, true); headlessRun(3, steps, false); }
+    return 0;
+}

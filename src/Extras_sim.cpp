@@ -747,6 +747,19 @@ void ParticleSystem::emit(const Vec2& p, const Vec2& v) {
 
 void ParticleSystem::emitBlock(const Vec2& origin, real w, real h, real spacing) {
     const real step = std::max((real)1e-3, spacing);
+    // Calibrate particle mass so a lattice with this spacing equals restDensity.
+    {
+        const real hh = smoothingRadius;
+        const real poly6 = 4.0 / (PI * std::pow(hh, 8.0));
+        real sum = 0.0;
+        const int R = (int)std::ceil(hh / step) + 1;
+        for (int dy = -R; dy <= R; ++dy)
+            for (int dx = -R; dx <= R; ++dx) {
+                const real r2 = (dx * step) * (dx * step) + (dy * step) * (dy * step);
+                if (r2 < hh * hh) { const real d = hh * hh - r2; sum += poly6 * d * d * d; }
+            }
+        if (sum > 1e-9) particleMass = restDensity / sum;
+    }
     for (real y = 0.0; y <= h; y += step)
         for (real x = 0.0; x <= w; x += step)
             emit(origin + Vec2(x, y), Vec2());
@@ -879,10 +892,228 @@ void ParticleSystem::integrate(real dt) {
 
 void ParticleSystem::update(real dt) {
     if (dt <= 0.0 || m_particles.empty()) return;
-    buildGrid();
-    computeDensity();
-    computeForces();
-    integrate(dt);
+    // ---------------------------------------------------------------- PBF step
+    // Position based fluid (Macklin & Muller): density constraints instead of
+    // explicit pressure forces. Stable at dt = 1/60 with 1-2 substeps.
+    {
+        const size_t n = m_particles.size();
+        const real h = smoothingRadius;
+        const real h2 = h * h;
+        const real poly6 = 4.0 / (PI * std::pow(h, 8.0));
+        const real gradCoef = -30.0 / (PI * std::pow(h, 5.0));
+        const real rho0 = std::max((real)1e-6, restDensity);
+        const real invRho0 = 1.0 / rho0;
+        const real eps = 120.0;
+        const int  iterations = 4;
+        const real maxSpeed = 26.0;
+        const real pad = h * 0.25;
+        const bool hasDomain = domain.min.x < domain.max.x;
+
+        std::vector<Vec2> prev(n), pred(n), delta(n);
+        std::vector<real> lambda(n, 0.0), dens(n, 0.0);
+        std::vector<int>  live;
+        live.reserve(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            FluidParticle& p = m_particles[i];
+            prev[i] = p.position;
+            pred[i] = p.position;
+            if (!p.active) continue;
+            if (!p.position.isFinite() || !p.velocity.isFinite()) {
+                p.position = Vec2((domain.min.x + domain.max.x) * 0.5, (domain.min.y + domain.max.y) * 0.5);
+                p.velocity = Vec2();
+                prev[i] = pred[i] = p.position;
+                continue;
+            }
+            p.velocity += gravity * dt;
+            const real sp = p.velocity.length();
+            if (sp > maxSpeed) p.velocity = p.velocity * (maxSpeed / sp);
+            pred[i] = p.position + p.velocity * dt;
+            if (hasDomain) {
+                pred[i].x = clampr(pred[i].x, domain.min.x + pad, domain.max.x - pad);
+                pred[i].y = clampr(pred[i].y, domain.min.y + pad, domain.max.y - pad);
+            }
+            live.push_back((int)i);
+        }
+        if (live.empty()) return;
+
+        std::unordered_map<uint64_t, std::vector<int> > grid;
+        const real invH = 1.0 / h;
+
+        for (int iter = 0; iter < iterations; ++iter) {
+            grid.clear();
+            for (size_t k = 0; k < live.size(); ++k) {
+                const size_t i = (size_t)live[k];
+                const uint64_t key = ((uint64_t)(uint32_t)(int)std::floor(pred[i].x * invH) << 32) ^
+                                     (uint64_t)(uint32_t)(int)std::floor(pred[i].y * invH);
+                grid[key].push_back((int)i);
+            }
+            for (size_t k = 0; k < live.size(); ++k) {
+                const size_t i = (size_t)live[k];
+                const int gx = (int)std::floor(pred[i].x * invH);
+                const int gy = (int)std::floor(pred[i].y * invH);
+                real rho = 0.0, sumSq = 0.0;
+                Vec2 gradSelf;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const uint64_t key = ((uint64_t)(uint32_t)(gx + dx) << 32) ^ (uint64_t)(uint32_t)(gy + dy);
+                        std::unordered_map<uint64_t, std::vector<int> >::const_iterator it = grid.find(key);
+                        if (it == grid.end()) continue;
+                        for (size_t t = 0; t < it->second.size(); ++t) {
+                            const size_t j = (size_t)it->second[t];
+                            const Vec2 d = pred[i] - pred[j];
+                            const real r2 = d.lengthSq();
+                            if (r2 >= h2) continue;
+                            const real diff = h2 - r2;
+                            rho += particleMass * poly6 * diff * diff * diff;
+                            if (j == i) continue;
+                            const real r = std::sqrt(r2);
+                            if (r < 1e-9) continue;
+                            const Vec2 gw = (d / r) * (gradCoef * (h - r) * (h - r) * particleMass * invRho0);
+                            gradSelf += gw;
+                            sumSq += gw.lengthSq();
+                        }
+                    }
+                dens[i] = rho;
+                sumSq += gradSelf.lengthSq();
+                const real C = clampr(rho / rho0 - 1.0, -0.25, 4.0);
+                lambda[i] = -C / (sumSq + eps);
+            }
+            for (size_t k = 0; k < live.size(); ++k) {
+                const size_t i = (size_t)live[k];
+                const int gx = (int)std::floor(pred[i].x * invH);
+                const int gy = (int)std::floor(pred[i].y * invH);
+                Vec2 dp;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const uint64_t key = ((uint64_t)(uint32_t)(gx + dx) << 32) ^ (uint64_t)(uint32_t)(gy + dy);
+                        std::unordered_map<uint64_t, std::vector<int> >::const_iterator it = grid.find(key);
+                        if (it == grid.end()) continue;
+                        for (size_t t = 0; t < it->second.size(); ++t) {
+                            const size_t j = (size_t)it->second[t];
+                            if (j == i) continue;
+                            const Vec2 d = pred[i] - pred[j];
+                            const real r2 = d.lengthSq();
+                            if (r2 >= h2 || r2 < 1e-12) continue;
+                            const real r = std::sqrt(r2);
+                            const Vec2 gw = (d / r) * (gradCoef * (h - r) * (h - r) * particleMass);
+                            dp += gw * ((lambda[i] + lambda[j]) * invRho0);
+                        }
+                    }
+                const real dpLen = dp.length();
+                const real limit = h * 0.30;
+                if (dpLen > limit) dp = dp * (limit / dpLen);
+                delta[i] = dp;
+            }
+            for (size_t k = 0; k < live.size(); ++k) {
+                const size_t i = (size_t)live[k];
+                pred[i] += delta[i];
+                if (hasDomain) {
+                    pred[i].x = clampr(pred[i].x, domain.min.x + pad, domain.max.x - pad);
+                    pred[i].y = clampr(pred[i].y, domain.min.y + pad, domain.max.y - pad);
+                }
+            }
+        }
+
+        const real invDt = 1.0 / dt;
+        for (size_t k = 0; k < live.size(); ++k) {
+            const size_t i = (size_t)live[k];
+            m_particles[i].velocity = (pred[i] - prev[i]) * invDt;
+            m_particles[i].position = pred[i];
+            m_particles[i].density = dens[i] > 0.0 ? dens[i] : rho0;
+            m_particles[i].pressure = std::max((real)0.0, stiffness * (m_particles[i].density - rho0));
+        }
+
+        // XSPH viscosity: neighbouring water moves together instead of jittering.
+        const real cvisc = clampr(viscosity * 0.02, 0.0, 0.55);
+        if (cvisc > 0.0) {
+            std::vector<Vec2> dv(n);
+            for (size_t k = 0; k < live.size(); ++k) {
+                const size_t i = (size_t)live[k];
+                const int gx = (int)std::floor(pred[i].x * invH);
+                const int gy = (int)std::floor(pred[i].y * invH);
+                Vec2 acc;
+                real wsum = 0.0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const uint64_t key = ((uint64_t)(uint32_t)(gx + dx) << 32) ^ (uint64_t)(uint32_t)(gy + dy);
+                        std::unordered_map<uint64_t, std::vector<int> >::const_iterator it = grid.find(key);
+                        if (it == grid.end()) continue;
+                        for (size_t t = 0; t < it->second.size(); ++t) {
+                            const size_t j = (size_t)it->second[t];
+                            if (j == i) continue;
+                            const Vec2 d = pred[i] - pred[j];
+                            const real r2 = d.lengthSq();
+                            if (r2 >= h2) continue;
+                            const real diff = h2 - r2;
+                            const real w = poly6 * diff * diff * diff;
+                            acc += (m_particles[j].velocity - m_particles[i].velocity) * w;
+                            wsum += w;
+                        }
+                    }
+                dv[i] = wsum > 1e-12 ? acc * (cvisc / wsum) : Vec2();
+            }
+            for (size_t k = 0; k < live.size(); ++k) m_particles[(size_t)live[k]].velocity += dv[(size_t)live[k]];
+        }
+        // Rigid bodies: push out along real shape geometry and trade impulses.
+        if (coupleWithRigid && m_world) {
+            for (size_t k = 0; k < live.size(); ++k) {
+                FluidParticle& p = m_particles[(size_t)live[k]];
+                RigidBody* hit = m_world->queryPoint(p.position);
+                if (!hit) continue;
+                Vec2 dir(0.0, 1.0);
+                real depth = 0.0;
+                bool inside = false;
+                const std::vector<Vec2>& wv = hit->worldVertices;
+                if (!wv.empty()) {
+                    real best = -1e30;
+                    Vec2 bestN(0.0, 1.0);
+                    for (size_t e = 0; e < wv.size(); ++e) {
+                        const Vec2 a = wv[e];
+                        const Vec2 c = wv[(e + 1) % wv.size()];
+                        const Vec2 ed = c - a;
+                        const real elen = ed.length();
+                        if (elen < 1e-12) continue;
+                        Vec2 nrm(ed.y / elen, -ed.x / elen);
+                        if (dot(nrm, (a + c) * 0.5 - hit->position) < 0.0) nrm = nrm * -1.0;
+                        const real d = dot(p.position - a, nrm);
+                        if (d > best) { best = d; bestN = nrm; }
+                    }
+                    if (best < 0.0) { inside = true; dir = bestN; depth = -best; }
+                } else if (hit->shape.halfLength > 0.0) {
+                    Vec2 a, c;
+                    hit->shape.capsuleSegment(hit->transform(), a, c);
+                    real tt = 0.0;
+                    const Vec2 cp = closestPointOnSegment(p.position, a, c, &tt);
+                    const Vec2 d = p.position - cp;
+                    const real len = d.length();
+                    if (len < hit->shape.radius) {
+                        inside = true;
+                        dir = len > 1e-9 ? d / len : Vec2(0.0, 1.0);
+                        depth = hit->shape.radius - len;
+                    }
+                } else {
+                    const Vec2 d = p.position - hit->position;
+                    const real len = d.length();
+                    if (len < hit->shape.radius) {
+                        inside = true;
+                        dir = len > 1e-9 ? d / len : Vec2(0.0, 1.0);
+                        depth = hit->shape.radius - len;
+                    }
+                }
+                if (!inside) continue;
+                p.position += dir * std::min(depth, h);
+                const Vec2 rel = p.velocity - hit->velocityAtPoint(p.position);
+                const real vn = dot(rel, dir);
+                if (vn < 0.0) {
+                    const Vec2 impulse = dir * (-vn * p.mass * (1.0 + clampr(boundaryDamping, 0.0, 1.0)));
+                    p.velocity += impulse / p.mass;
+                    p.velocity -= (rel - dir * vn) * 0.25;
+                    if (hit->isDynamic()) hit->applyImpulseAtPoint(impulse * -1.0, p.position);
+                }
+            }
+        }
+    }
 
     // Волны на поверхности: одномерное волновое уравнение по верхним частицам.
     const size_t columns = 128;
@@ -908,6 +1139,17 @@ void ParticleSystem::update(real dt) {
         }
         for (size_t i = 0; i < columns; ++i) m_waveHeight[i] += m_waveVelocity[i] * dt;
     }
+}
+
+real ParticleSystem::wetnessAt(const Vec2& p, real radius) const {
+    if (m_particles.empty() || radius <= 0.0) return 0.0;
+    const real r2 = radius * radius;
+    int hits = 0;
+    for (size_t i = 0; i < m_particles.size(); ++i) {
+        if (!m_particles[i].active) continue;
+        if ((m_particles[i].position - p).lengthSq() < r2) { if (++hits >= 24) break; }
+    }
+    return clampr((real)hits / 10.0, 0.0, 1.0);
 }
 
 real ParticleSystem::surfaceHeight(real x) const {
