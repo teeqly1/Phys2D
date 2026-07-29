@@ -11,8 +11,8 @@ The engine was written from scratch by a single developer in four months and alr
 ## 🔗 Navigation
 - **[Original README](README.md)** — original readme in English
 - **[Phys2D for games](README_GAME_EN.md)** — creating games with physics, blood, and destruction in English
-- **[Phys2D interactive scene](README_REALTIME.md)** — testing physics in real time
-- **[Phys2D for games](README_GAME.md)** — creating games with physics, blood, and destruction
+- **[Phys2D interactive scene](README_REALTIME_EN.md)** — testing physics in real time
+- **[Phys2D for games](README_GAME_EN.md)** — creating games with physics, blood, and destruction
 - **[Phys2D documentation (English)](DOCS_EN.md)** — full technical documentation in English
 - **[Phys2D interactive scene](README_REALTIME.md)** — testing physics in real time
 
