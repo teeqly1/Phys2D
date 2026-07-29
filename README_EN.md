@@ -1,103 +1,93 @@
-# phys2d
+## 📄 README.md
 
-Header `include/phys2d/Extras.h`,
-six implementation modules `src/Extras_*.cpp`, demo `examples/demo_v2.cpp`.
+# Phys2D — a physics engine for games, simulations, and wild experiments
 
-## Build (MSYS2 MINGW64)
+**Phys2D** is a high-performance, open-source 2D physics engine written in C++. It's designed for those who want to add realistic physics, blood, destruction, fluids, electricity, soft bodies, and much more to their games.
+
+The engine was written from scratch by a single developer in four months and already outperforms Box2D in a number of benchmarks. It's freely available, but with a simple condition: don't sell it as a standalone product, and if you modify it, please credit the author.
+
+---
+
+## 🔗 Navigation
+- **[Original README](README.md)** — original readme in English
+- **[Phys2D for games](README_GAME_EN.md)** — creating games with physics, blood, and destruction in English
+- **[Phys2D interactive scene](README_REALTIME.md)** — testing physics in real time
+- **[Phys2D for games](README_GAME.md)** — creating games with physics, blood, and destruction
+- **[Phys2D documentation (English)](DOCS_EN.md)** — full technical documentation in English
+- **[Phys2D interactive scene](README_REALTIME.md)** — testing physics in real time
+
+---
+
+## 🚀 What Phys2D Can Do
+
+| Scope | Capabilities |
+|---------|------------|
+| **Rigid Bodies** | Circles, rectangles, polygons, capsules. SAT, GJK+EPA, continuous collision detection (CCD), beams. |
+| **Materials** | 50 built-in materials (steel, glass, concrete, rubber, wood, ice, fabric, nitinol, etc.). 50x50 pair table with friction, recovery, and conductivity. |
+| **Joints** | Distance, hinge, spring, cable, angle, weld, motor, prismatic, pulley, gear, catenary, destructible joints. |
+| **Destruction** | Voronov fragmentation, radial fracture, precise momentum conservation (up to 10⁻¹⁵), fragment generations. |
+| **Soft Bodies** | Mass-spring, co-rotational FEM, hybrid model, internal pressure, bond breaking, interaction with solids. |
+| **Fluids (SPH)** | Density, pressure, viscosity, surface tension, waves, bonding with solids. |
+| **Electricity** | Water current (resistor network), electrodes, electric shocks, Joule heating, electrokinetics, arc, piezoelectric effect, tribocharging. |
+| **Fields** | N-body gravity (Barnes-Hut algorithm), electrostatics, magnetism, wind (Perlin noise), Coriolis, centrifugal force, tidal forces, radiation pressure. |
+| **Thermodynamics** | Thermal conductivity, frictional heating, thermal expansion, phase transitions, piezoelectric effect. |
+| **Materials** | Fatigue (Baskin), creep (Norton), stress relaxation, viscoelasticity (Kelvin-Voigt), nonlinear elasticity, plasticity, shape memory (Nitinol), impact strength, corrosion, oxidation, radiation, ablation. |
+| **Surfaces** | Adhesion, cohesion, capillary bridges, diffusion, osmosis. |
+| **Blood** | Drops, decals, puddles, wounds with pulsation, color from oxygen, drying, smudging, dripping, imprints on bodies. |
+| **Sensors** | Trigger zones with Enter/Stay/Exit events, layer filtering. |
+| **Tools** | JSON serialization, import/export (Box2D, Bullet, OBJ), scripting language, console, profiler, benchmarks, debug rendering. |
+| **Optimization** | SIMD (AVX/SSE), thread pool, pin cache, 65536-level trig table, early iteration exit, islands. |
+
+---
+
+## 📦 What's on board
+
+```
+phys2d/
+├── include/phys2d/ # Header files (API)
+│ ├── World.h # Core: bodies, joints, simulation step
+│ ├── Body.h # Rigid bodies
+│ ├── Shape.h # Shapes (circle, box, polygon, capsule)
+│ ├── Collision.h # SAT, GJK+EPA, manifolds, CCD
+│ ├── Constraints.h # Basic joints
+│ ├── Extras.h # Extended API (everything else)
+│ ├── Advanced.h # Advanced Lab (wind, current, materials, fragments)
+│ ├── Blood.h # Blood system
+│ ├── phys2d_c_api.h # C-API for FFI
+│ └── ...
+├── src/ # Sources
+│ ├── World.cpp
+│ ├── Body.cpp
+│ ├── Collision.cpp
+│ ├── Constraints.cpp
+│ ├── Extras_*.cpp # Module breakdown
+│ ├── Advanced.cpp
+│ ├── Blood.cpp
+│ └── ...
+├── examples/ # Demos
+│ ├── demo_v2.cpp # Full demo of the entire API
+│ ├── realtime_scene.cpp # Interactive scene (Win32)
+│ ├── advanced_lab.cpp # Advanced Lab (block 1)
+│ ├── sandbox_game.cpp # Gore Lab — a sandbox with blood
+│ ├── test_scene.cpp # Test scene (1000+ bodies)
+│ └── ...
+├── README.md # This file
+├── README_EN.md # Documentation in English
+├── README_GAME.md # For game developers
+├── README_REALTIME.md # Interactive scene
+├── DOCS.md # Full documentation on features and API
+├── LICENSE # License
+└── CMakeLists.txt # Build
+```
+
+---
+
+## 🛠 Quick Start
+
+### Build (Windows, MinGW)
 
 ```bash
-cd /c/
-cmake -B build -G "MinGW Makefiles" \ 
--DCMAKE_MAKE_PROGRAM=mingw32-make \ 
--DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \ 
--DCMAKE_BUILD_TYPE=Release \ 
--DPHYS2D_NATIVE=ON -DPHYS2D_SIMD_AVX=ON -DPHYS2D_FMA=ON \ 
--DPHYS2D_BIG_BINARY=ON -DPHYS2D_TABLE_MB=34
-cmake --build build -j$(nproc)
-
-./build/phys2d_demo_v2.exe --steps 240 # demo of all Subsystems
-./build/phys2d_demo_v2.exe --benchmark # 11 scenes + report
-./build/phys2d_realtime.exe # realtime window
-```
-
-Without CMake:
-
-```bash
-g++ -std=c++17 -O3 -march=native -Iinclude examples/demo_v2.cpp src/*.cpp -pthread -o demo_v2.exe
-```
-
-## Entry Point: Engine class
-
-`Engine` owns the world and all subsystems; `step(dt)` runs them in the correct order.
-
-```cpp
-#include "phys2d/Extras.h"
-using namespace phys2d;
-
-Engine engine;
-engine.fracture().enabled = true; // fracture
-engine.softBodies().enabled = true; // soft bodies
-engine.fluid().enabled = true; // SPH
-engine.fields().enabled = true; // fields
-engine.fields().flags = FIELD_WIND | FIELD_NBODY;
-
-for (int i = 0; i < 600; ++i) engine.step(1.0 / 60.0);
-std::puts(engine.statusLine().c_str());
-```
-
-All subsystems are enabled/disabled by the `enabled` flag; they are also available individually
-(without `Engine`): just call `attach(world)` and `update(dt)`.
-
-## What's implemented
-
-| Scope | Capabilities | Status |
-|---|---|---|
-| CCD | swept circle/segment, swept AABB, conservative advancement, tunneling rollback | Implemented |
-| Rays | `rayCastClosest`, `rayCastAll`, `rayCastShape`, filter by layers | Implemented |
-| Joints | weld (soft), motor, prismatic, pulley, gear, catenary rope, breakable | Implemented |
-| Fracture | Voronoi fragmentation, radial fracture, momentum threshold, fragment generation | Implemented |
-| Soft bodies | mass-spring, co-rotational FEM, hybrid, pressure, rupture, body bond | Implemented |
-| Ragdoll | 11 parts, 10 joints + angular constraints | Implemented |
-| Fluid | SPH: density, pressure, viscosity, surface tension, waves | Implemented |
-| Fields | N-body (Barnes-Hut), electrostatics, magnetism, wind (Perlin), Coriolis, centrifugal, tidal, light pressure | Implemented |
-| Heat | Thermal conductivity, friction heating, expansion, phase transitions, piezoelectric effect | Implemented |
-| Sound | Impact synthesis, Doppler, mixing, WAV export | Implemented |
-| Layers and Materials | Categories/Masks/Groups, 50 materials, 50x50 pair table, anisotropic friction | Implemented |
-| Sensors | Trigger zones, Enter/Stay/Exit events | Implemented |
-| Islands | Union-find, parallel island solving | Implemented |
-| Geometry | Concave subdivision, Bezier, NURBS, terrain, BSP, BVH with shaft optimization | Implemented |
-| Import/Export | .obj, JSON states, .b2d (Box2D), .bullet | Implemented |
-| Recording | Binary log with timestamp, snapshots, rewind/seek | Implemented |
-| Reliability | Pulse clipping, quantization, NaN repair, dead body GC, 64-bit IDs | implemented |
-| Accuracy | Predictor-corrector, adaptive stride, higher-order inertia | implemented |
-| Templates | `ContactKernel<T, Flags>` — 16 instantiations (float/double x 8 flags) | implemented |
-| Tables | 65536-level trigonometry, 1024-level contact cache, 4096-body pool | implemented |
-| Tools | command line, scripting language, console, profiler-graph, 11 benchmarks | implemented |
-
-## Approximations and Limitations
-
-| Requirement | How it's done |
-|---|---|
-| Lua scripting | Native interpreter (variables, expressions, `if`, `repeat`, commands) — no external dependency on Lua |
-| Remote console | Console polling a command file instead of a TCP server |
-| CUDA | not enabled; parallelism via thread pool and islands |
-| OpenGL with shaders, shadow map, 3D parallax | rendering via Win32/GDI (`phys2d_realtime`) and SVG debugging; no shader backend |
-| Sound with Doppler | synthesis to buffer and WAV export; no realtime playback |
-
-## Bugs found and fixed (this stage)
-
-1. **Soft weld joint diverged** at small stepping: the `gamma` coefficient was not included
-
-in the effective mass. This only occurred with fast bodies (gears),
-
-including substepping. Fixed in `WeldJoint::prepare`.
-2. Perlin noise returned garbage at large coordinates — `(int)std::floor(x)`
-overflowed. Wind produced infinite force. Added finiteness check
-and coordinate folding.
-3. Wind accelerated light chain links: added acceleration limit
-`FieldSystem::maxWindAcceleration` (250 m/s² by default).
-4. Soft-rigid body coupling**: momentum is limited to the smaller of the two masses,
-added checks for non-finite states.
-
-Residual note: in the most dense demo scene (cable + gears + fluid +
-soft bodies + all fields simultaneously), `SafetyGuard` still occasionally repairs some
+cd /d/projects/phys2d
+cmake -B build -G "MinGW Makefiles" \
+-DCMAKE_MAKE_PROGRAM=mingw32-make \
+-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
