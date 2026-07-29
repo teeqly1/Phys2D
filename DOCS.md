@@ -1,4 +1,4 @@
-
+- **[Documentation in English](DOCS_EN.md)** — original documentation in English
 
 ## 📄 DOCS.md
 
