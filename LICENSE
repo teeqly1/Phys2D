@@ -1,0 +1,24 @@
+Phys2D Physics Engine - License
+==================================
+
+Copyright (c) 2026 teeqly1 (https://github.com/teeqly1)
+
+This license permits the use, copying, modification, and distribution of the Phys2D software (hereinafter referred to as the "Engine"), subject to the following conditions:
+
+1. The Engine is FREE for use in any projects, including commercial games,
+applications, and simulations. No royalties, fees, or payments are required.
+
+2. Selling the Engine as a standalone product is PROHIBITED. You may not distribute
+Phys2D or its modified versions for money. This includes, but is not limited to:
+selling the code, selling compiled libraries (.lib, .dll, .so), selling access
+to the source code, or creating commercial forks with a different name.
+
+3. If you modify the Engine source code (add functionality, fix bugs, optimize) and distribute your version, YOU MUST provide prominent credit to the original author — teeqly1 — in the documentation, README file, or
+in the credits of your project.
+
+4. Using the Engine in your project DOES NOT REQUIRE attribution in the product itself
+(for example, in the game menu), but it is encouraged.
+
+5. The Engine is provided "AS IS," without any warranties. The author is not liable
+for any loss or damage resulting from
+using the Engine.
