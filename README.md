@@ -12,11 +12,12 @@
 ---
 
 ## 🔗 Навигация
-- **[Original README](README.md)** — original readme in English
+- **[Original README](README_EN.md)** — original readme in English
 - **[Phys2D for games](README_GAME_EN.md)** - creating games with physics, blood, and destruction in english
-- **[Phys2D interactive scene](README_REALTIME.md)** — testing physics in real time
+- **[Phys2D interactive scene](README_REALTIME_EN.md)** — testing physics in real time english docs
+- **[Phys2D documentation (English)](DOCS_EN.md)** - full technical documentation in English
 - **[Phys2D для игр](README_GAME.md)** — создание игр с физикой, кровью и разрушением
-- **[Phys2D документация (English)](DOCS_EN.md)** — полная техническая документация на английском
+- **[Phys2D документация (English)](DOCS.md)** — полная техническая документация на русском
 - **[Phys2D интерактивная сцена](README_REALTIME.md)** — тестирование физики в реальном времени
 
 ---
